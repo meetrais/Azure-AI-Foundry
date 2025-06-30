@@ -75,15 +75,6 @@ async def run_agentic_chatbot():
     else:
         base_endpoint = endpoint
 
-    # Debug: Print configuration
-    print("=== Configuration Debug ===")
-    print(f"Base Endpoint: {base_endpoint}")
-    print(f"Model Name: {model_name}")
-    print(f"API Version: {api_version}")
-    print(f"API Key present: {'Yes' if api_key else 'No'}")
-    print(f"API Key length: {len(api_key) if api_key else 0}")
-    print("==========================")
-
     # Validate configuration
     if not base_endpoint:
         print("ERROR: ENDPOINT_URL environment variable is not set")
