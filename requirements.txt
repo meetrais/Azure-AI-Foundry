@@ -2,3 +2,4 @@ azure-ai-inference~=1.0.0b7
 ansible-core~=2.17.0
 python-dotenv
 semantic-kernel
+openai
