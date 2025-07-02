@@ -58,17 +58,79 @@ def create_tool_dict(metadata):
         }
     }
 
-def categorize_input(user_input):
-    """Simple keyword-based categorization."""
+async def categorize_with_llm(chat_service, user_input):
+    """Use LLM to categorize user input into predefined categories."""
+    
+    categorization_prompt = f"""You are a categorization assistant. Analyze the user's request and determine which category it belongs to.
+
+Available categories:
+1. Report Sick - for health issues, illness, feeling unwell, sickness, medical problems, pain, headaches
+2. Report Fatigue - for tiredness, exhaustion, fatigue, being worn out, sleepiness, energy issues
+3. Book Hotel - for hotel bookings, accommodation requests, room reservations, lodging
+4. Book Limo - for transportation requests, ride bookings, car services, taxi requests, travel
+
+User request: "{user_input}"
+
+Rules:
+- Respond with ONLY the exact category name (e.g., "Report Sick")
+- If the request doesn't clearly match any category, respond with "no_match"
+- Do not provide explanations or additional text
+- Be flexible in understanding different ways people might express these needs
+
+Category:"""
+
+    # Create a temporary chat history for categorization
+    temp_chat_history = ChatHistory()
+    temp_chat_history.add_user_message(categorization_prompt)
+    
+    execution_settings = PromptExecutionSettings(
+        tool_choice="none",
+        temperature=0.1,  # Low temperature for consistent categorization
+        max_tokens=50     # Short response expected
+    )
+    
+    try:
+        result = await chat_service.get_chat_message_contents(
+            temp_chat_history,
+            settings=execution_settings,
+        )
+        
+        category = str(result[0].content).strip()
+        
+        # Validate the response is one of our expected categories
+        valid_categories = ["Report Sick", "Report Fatigue", "Book Hotel", "Book Limo", "no_match"]
+        
+        if category in valid_categories:
+            return category if category != "no_match" else None
+        else:
+            # If LLM returns something unexpected, try to match it to our categories
+            category_lower = category.lower()
+            if "sick" in category_lower or "health" in category_lower:
+                return "Report Sick"
+            elif "fatigue" in category_lower or "tired" in category_lower:
+                return "Report Fatigue"
+            elif "hotel" in category_lower or "accommodation" in category_lower:
+                return "Book Hotel"
+            elif "limo" in category_lower or "transport" in category_lower or "ride" in category_lower:
+                return "Book Limo"
+            else:
+                return fallback_categorization(user_input)
+                
+    except Exception as e:
+        st.warning(f"LLM categorization failed: {str(e)[:100]}... Using fallback method.")
+        # Fallback to simple keyword matching if LLM fails
+        return fallback_categorization(user_input)
+
+def fallback_categorization(user_input):
+    """Fallback keyword-based categorization if LLM fails."""
     user_input_lower = user_input.lower().strip()
     
-    # Define keywords for each category
-    sick_keywords = ['sick', 'ill', 'illness', 'not well', 'unwell', 'health', 'disease', 'fever', 'cold', 'flu']
-    fatigue_keywords = ['tired', 'exhausted', 'fatigue', 'sleepy', 'worn out', 'weary', 'drained']
-    hotel_keywords = ['hotel', 'accommodation', 'room', 'stay', 'booking', 'lodge', 'inn', 'resort']
-    limo_keywords = ['limo', 'ride', 'car', 'transport', 'taxi', 'transportation', 'vehicle', 'drive']
+    # Enhanced keyword fallback with better matching
+    sick_keywords = ['sick', 'ill', 'illness', 'not well', 'not feeling well', 'unwell', 'health', 'disease', 'fever', 'cold', 'flu', 'headache', 'pain', 'hurt', 'ache']
+    fatigue_keywords = ['tired', 'exhausted', 'fatigue', 'sleepy', 'worn out', 'weary', 'drained', 'energy', 'rest']
+    hotel_keywords = ['hotel', 'accommodation', 'room', 'stay', 'booking', 'lodge', 'inn', 'resort', 'check in']
+    limo_keywords = ['limo', 'ride', 'car', 'transport', 'taxi', 'transportation', 'vehicle', 'drive', 'uber', 'lyft']
     
-    # Check for keyword matches
     if any(keyword in user_input_lower for keyword in sick_keywords):
         return "Report Sick"
     elif any(keyword in user_input_lower for keyword in fatigue_keywords):
@@ -95,6 +157,13 @@ def initialize_chatbot():
         base_endpoint = endpoint.split("/openai/deployments/")[0]
     else:
         base_endpoint = endpoint
+
+    # Show configuration in sidebar for debugging
+    with st.sidebar:
+        with st.expander("🔧 Configuration Debug", expanded=False):
+            st.write(f"**Endpoint:** {base_endpoint}")
+            st.write(f"**Model:** {model_name}")
+            st.write(f"**API Key:** {'✅ Present' if api_key else '❌ Missing'}")
 
     # Validate configuration
     if not base_endpoint or not api_key or not model_name:
@@ -134,8 +203,8 @@ def main():
         layout="wide"
     )
 
-    st.title("🤖 AI Request Assistant")
-    st.markdown("I can help you with reporting sickness, reporting fatigue, booking hotels, or booking transportation.")
+    st.title("🤖 AI Request Assistant (LLM-Powered)")
+    st.markdown("I use AI to understand your requests for reporting sickness, reporting fatigue, booking hotels, or booking transportation.")
 
     # Initialize chatbot
     kernel, chat_service = initialize_chatbot()
@@ -177,7 +246,7 @@ def main():
                         
                         # Add user confirmation and bot response to chat
                         st.session_state.messages.append({"role": "user", "content": "Yes"})
-                        st.session_state.messages.append({"role": "assistant", "content": response})
+                        st.session_state.messages.append({"role": "assistant", "content": f"✅ {response}"})
                         
                         # Reset confirmation state
                         st.session_state.waiting_for_confirmation = False
@@ -207,8 +276,10 @@ def main():
             # Add user message to chat history
             st.session_state.messages.append({"role": "user", "content": prompt})
             
-            # Categorize the input
-            category = categorize_input(prompt)
+            # Show analyzing message
+            with st.spinner("🔍 Analyzing your request with AI..."):
+                # Categorize the input using LLM
+                category = asyncio.run(categorize_with_llm(chat_service, prompt))
             
             # Define valid categories
             valid_categories = {
@@ -222,7 +293,7 @@ def main():
                 function_name, description = valid_categories[category]
                 
                 # Show identified category
-                category_message = f"I've identified your request as: **{category}**\n\nWould you like me to raise a request for this?"
+                category_message = f"🎯 I've identified your request as: **{category}**\n\nWould you like me to raise a request for this?"
                 st.session_state.messages.append({"role": "assistant", "content": category_message})
                 
                 # Set up confirmation state
@@ -232,7 +303,7 @@ def main():
                 
             else:
                 # Unable to categorize
-                error_message = "I'm sorry, I couldn't categorize your request. I can help you with reporting sickness, reporting fatigue, booking hotels, or booking transportation. Could you please clarify what you need help with?"
+                error_message = "🤔 I'm sorry, I couldn't categorize your request. I can help you with reporting sickness, reporting fatigue, booking hotels, or booking transportation. Could you please clarify what you need help with?"
                 st.session_state.messages.append({"role": "assistant", "content": error_message})
             
             st.rerun()
@@ -258,10 +329,18 @@ def main():
         
         st.header("💡 Example Requests")
         st.markdown("""
-        - "I'm not feeling well"
-        - "I need a hotel room"
-        - "I'm really tired today"
-        - "Book me a ride"
+        - "I have a headache"
+        - "Need somewhere to stay tonight"
+        - "Feeling really drained"
+        - "Can you get me a ride?"
+        """)
+        
+        st.header("🤖 AI Features")
+        st.markdown("""
+        - **Intelligent categorization** using LLM
+        - **Fallback to keywords** if AI fails
+        - **Natural language understanding**
+        - **Flexible request interpretation**
         """)
         
         if st.button("🗑️ Clear Chat History"):
