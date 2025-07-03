@@ -8,6 +8,7 @@ from semantic_kernel.functions.kernel_arguments import KernelArguments
 from semantic_kernel.contents.chat_history import ChatHistory
 from semantic_kernel.functions.kernel_function_decorator import kernel_function
 from dotenv import load_dotenv
+from openai import AzureOpenAI
 
 class ToolPlugin:
     """A plugin that exposes tools for the chatbot."""
@@ -58,8 +59,8 @@ def create_tool_dict(metadata):
         }
     }
 
-async def categorize_with_llm(chat_service, user_input):
-    """Use LLM to categorize user input into predefined categories."""
+def categorize_with_direct_openai(openai_client, user_input, model_name):
+    """Use direct OpenAI client to categorize user input."""
     
     categorization_prompt = f"""You are a categorization assistant. Analyze the user's request and determine which category it belongs to.
 
@@ -79,23 +80,17 @@ Rules:
 
 Category:"""
 
-    # Create a temporary chat history for categorization
-    temp_chat_history = ChatHistory()
-    temp_chat_history.add_user_message(categorization_prompt)
-    
-    execution_settings = PromptExecutionSettings(
-        tool_choice="none",
-        temperature=0.1,  # Low temperature for consistent categorization
-        max_tokens=50     # Short response expected
-    )
-    
     try:
-        result = await chat_service.get_chat_message_contents(
-            temp_chat_history,
-            settings=execution_settings,
+        response = openai_client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "user", "content": categorization_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=50
         )
         
-        category = str(result[0].content).strip()
+        category = response.choices[0].message.content.strip()
         
         # Validate the response is one of our expected categories
         valid_categories = ["Report Sick", "Report Fatigue", "Book Hotel", "Book Limo", "no_match"]
@@ -114,33 +109,11 @@ Category:"""
             elif "limo" in category_lower or "transport" in category_lower or "ride" in category_lower:
                 return "Book Limo"
             else:
-                return fallback_categorization(user_input)
+                return None
                 
     except Exception as e:
-        st.warning(f"LLM categorization failed: {str(e)[:100]}... Using fallback method.")
-        # Fallback to simple keyword matching if LLM fails
-        return fallback_categorization(user_input)
-
-def fallback_categorization(user_input):
-    """Fallback keyword-based categorization if LLM fails."""
-    user_input_lower = user_input.lower().strip()
-    
-    # Enhanced keyword fallback with better matching
-    sick_keywords = ['sick', 'ill', 'illness', 'not well', 'not feeling well', 'unwell', 'health', 'disease', 'fever', 'cold', 'flu', 'headache', 'pain', 'hurt', 'ache']
-    fatigue_keywords = ['tired', 'exhausted', 'fatigue', 'sleepy', 'worn out', 'weary', 'drained', 'energy', 'rest']
-    hotel_keywords = ['hotel', 'accommodation', 'room', 'stay', 'booking', 'lodge', 'inn', 'resort', 'check in']
-    limo_keywords = ['limo', 'ride', 'car', 'transport', 'taxi', 'transportation', 'vehicle', 'drive', 'uber', 'lyft']
-    
-    if any(keyword in user_input_lower for keyword in sick_keywords):
-        return "Report Sick"
-    elif any(keyword in user_input_lower for keyword in fatigue_keywords):
-        return "Report Fatigue"
-    elif any(keyword in user_input_lower for keyword in hotel_keywords):
-        return "Book Hotel"
-    elif any(keyword in user_input_lower for keyword in limo_keywords):
-        return "Book Limo"
-    
-    return None
+        st.error(f"LLM categorization failed: {str(e)}")
+        return None
 
 @st.cache_resource
 def initialize_chatbot():
@@ -151,6 +124,7 @@ def initialize_chatbot():
     endpoint = os.getenv("ENDPOINT_URL")
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
     model_name = os.getenv("DEPLOYMENT_NAME")
+    api_version = os.getenv("API_VERSION")
 
     # Extract the base endpoint (remove the full path)
     if endpoint and "/openai/deployments/" in endpoint:
@@ -163,16 +137,25 @@ def initialize_chatbot():
         with st.expander("🔧 Configuration Debug", expanded=False):
             st.write(f"**Endpoint:** {base_endpoint}")
             st.write(f"**Model:** {model_name}")
+            st.write(f"**API Version:** {api_version}")
             st.write(f"**API Key:** {'✅ Present' if api_key else '❌ Missing'}")
 
     # Validate configuration
     if not base_endpoint or not api_key or not model_name:
         st.error("Configuration error: Please check your environment variables.")
-        return None, None
+        return None, None, None
 
+    # Initialize direct OpenAI client for categorization
+    openai_client = AzureOpenAI(
+        api_key=api_key,
+        api_version=api_version or "2024-12-01-preview",
+        azure_endpoint=base_endpoint
+    )
+
+    # Initialize Semantic Kernel for function calling
     kernel = sk.Kernel()
     
-    # Use Azure AI Inference connector with proper endpoint format
+    # Use Azure AI Inference connector for function calling (we'll bypass LLM categorization)
     chat_service = AzureAIInferenceChatCompletion(
         ai_model_id=model_name,
         endpoint=base_endpoint,
@@ -181,7 +164,7 @@ def initialize_chatbot():
     kernel.add_service(chat_service)
     kernel.add_plugin(ToolPlugin(), "ToolPlugin")
 
-    return kernel, chat_service
+    return kernel, chat_service, openai_client
 
 async def process_request(kernel, category, function_name):
     """Process the user request and call the appropriate function."""
@@ -207,7 +190,7 @@ def main():
     st.markdown("I use AI to understand your requests for reporting sickness, reporting fatigue, booking hotels, or booking transportation.")
 
     # Initialize chatbot
-    kernel, chat_service = initialize_chatbot()
+    kernel, chat_service, openai_client = initialize_chatbot()
     
     if kernel is None:
         st.stop()
@@ -278,8 +261,10 @@ def main():
             
             # Show analyzing message
             with st.spinner("🔍 Analyzing your request with AI..."):
-                # Categorize the input using LLM
-                category = asyncio.run(categorize_with_llm(chat_service, prompt))
+                # Get model name from environment
+                model_name = os.getenv("DEPLOYMENT_NAME")
+                # Categorize using direct OpenAI client
+                category = categorize_with_direct_openai(openai_client, prompt, model_name)
             
             # Define valid categories
             valid_categories = {
@@ -337,10 +322,10 @@ def main():
         
         st.header("🤖 AI Features")
         st.markdown("""
-        - **Intelligent categorization** using LLM
-        - **Fallback to keywords** if AI fails
+        - **Intelligent categorization** using direct OpenAI
         - **Natural language understanding**
         - **Flexible request interpretation**
+        - **Reliable AI-powered analysis**
         """)
         
         if st.button("🗑️ Clear Chat History"):
