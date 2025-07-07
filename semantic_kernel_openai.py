@@ -96,19 +96,6 @@ Category:"""
         
         if category in valid_categories:
             return category if category != "no_match" else None
-        else:
-            # If LLM returns something unexpected, try to match it to our categories
-            category_lower = category.lower()
-            if "sick" in category_lower or "health" in category_lower:
-                return "Report Sick"
-            elif "fatigue" in category_lower or "tired" in category_lower:
-                return "Report Fatigue"
-            elif "hotel" in category_lower or "accommodation" in category_lower:
-                return "Book Hotel"
-            elif "limo" in category_lower or "transport" in category_lower or "ride" in category_lower:
-                return "Book Limo"
-            else:
-                return None
                 
     except Exception as e:
         print(f"❌ LLM categorization failed: {str(e)}")
