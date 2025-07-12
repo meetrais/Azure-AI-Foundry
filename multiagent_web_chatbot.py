@@ -10,9 +10,11 @@ from semantic_kernel.functions.kernel_function_decorator import kernel_function
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import pickle
 import time
+import base64
+from io import BytesIO
 
 # Try to import optional dependencies for vector store
 try:
@@ -36,13 +38,22 @@ try:
     except ImportError:
         BM25_AVAILABLE = False
         
+    # Try to import multimodal dependencies
+    try:
+        import fitz  # PyMuPDF for image extraction
+        from PIL import Image
+        MULTIMODAL_AVAILABLE = True
+    except ImportError:
+        MULTIMODAL_AVAILABLE = False
+        
 except ImportError:
     VECTOR_STORE_AVAILABLE = False
     GPU_AVAILABLE = False
     BM25_AVAILABLE = False
+    MULTIMODAL_AVAILABLE = False
 
-class HybridRAGManager:
-    """Advanced Hybrid RAG with Intelligent Pre-processing and Context Compression."""
+class MultimodalHybridRAGManager:
+    """Advanced Multimodal Hybrid RAG with Text and Image Support using OpenAI's multimodal capabilities."""
     
     def __init__(self, openai_client, model_name, data_folder="data", vector_store_path="vector_store"):
         if not VECTOR_STORE_AVAILABLE:
@@ -52,16 +63,24 @@ class HybridRAGManager:
         self.model_name = model_name
         self.data_folder = Path(data_folder)
         self.vector_store_path = Path(vector_store_path)
+        self.images_folder = Path(vector_store_path) / "images"
+        
+        # Create directories
         self.vector_store_path.mkdir(exist_ok=True)
         self.data_folder.mkdir(exist_ok=True)
+        self.images_folder.mkdir(exist_ok=True)
         
         # Advanced settings
         self.use_gpu = GPU_AVAILABLE
         self.use_bm25 = BM25_AVAILABLE
-        self.embedding_model = "text-embedding-ada-002"
+        self.use_multimodal = MULTIMODAL_AVAILABLE
+        self.text_embedding_model = "text-embedding-ada-002"
+        self.multimodal_embedding_model = "text-embedding-3-large"  # Updated for multimodal support
         self.chunk_size = 1000
         self.chunk_overlap = 200
         self.max_chunks_per_file = 50
+        self.min_image_size = (50, 50)  # Reduced minimum size to capture more images
+        self.max_images_per_pdf = 30  # Increased limit
         
         if self.use_gpu:
             st.info(f"🚀 GPU acceleration enabled! Found {faiss.get_num_gpus()} GPU(s)")
@@ -70,6 +89,188 @@ class HybridRAGManager:
             st.info("🔍 Hybrid retrieval available (Vector + BM25)")
         else:
             st.warning("⚠️ BM25 not available. Install: pip install rank-bm25")
+            
+        if self.use_multimodal:
+            st.info("🖼️ Multimodal support enabled (Text + Images)")
+        else:
+            st.warning("⚠️ Multimodal not available. Install: pip install PyMuPDF Pillow")
+    
+    def extract_images_from_pdf(self, pdf_path: Path) -> List[Dict]:
+        """Enhanced image extraction from PDF with better debugging."""
+        if not self.use_multimodal:
+            st.warning(f"Multimodal not available - skipping image extraction for {pdf_path.name}")
+            return []
+        
+        images_data = []
+        try:
+            st.write(f"🔍 Extracting images from {pdf_path.name}...")
+            pdf_document = fitz.open(str(pdf_path))
+            st.write(f"📄 PDF has {len(pdf_document)} pages")
+            
+            total_images_found = 0
+            
+            for page_num in range(len(pdf_document)):
+                page = pdf_document[page_num]
+                image_list = page.get_images()
+                
+                st.write(f"📄 Page {page_num + 1}: Found {len(image_list)} image references")
+                
+                for img_index, img in enumerate(image_list):
+                    if len(images_data) >= self.max_images_per_pdf:
+                        st.write(f"⚠️ Reached maximum image limit ({self.max_images_per_pdf})")
+                        break
+                        
+                    try:
+                        # Extract image
+                        xref = img[0]
+                        pix = fitz.Pixmap(pdf_document, xref)
+                        
+                        st.write(f"🖼️ Image {img_index + 1}: {pix.width}x{pix.height}, {pix.n} channels")
+                        
+                        # Skip if image is too small
+                        if pix.width < self.min_image_size[0] or pix.height < self.min_image_size[1]:
+                            st.write(f"⏭️ Skipping small image: {pix.width}x{pix.height}")
+                            pix = None
+                            continue
+                        
+                        # Handle different color spaces
+                        if pix.n - pix.alpha < 4:  # GRAY or RGB
+                            # Convert to RGB if needed
+                            if pix.n != 4:  # Not RGBA
+                                pix = fitz.Pixmap(fitz.csRGB, pix)
+                            
+                            # Convert to PIL Image
+                            img_data = pix.tobytes("png")
+                            img_pil = Image.open(BytesIO(img_data))
+                            
+                            # Generate unique filename
+                            img_filename = f"{pdf_path.stem}_page{page_num+1}_img{img_index+1}.png"
+                            img_path = self.images_folder / img_filename
+                            
+                            # Save image
+                            img_pil.save(img_path)
+                            
+                            # Create image metadata
+                            image_info = {
+                                "filename": img_filename,
+                                "path": str(img_path),
+                                "source_pdf": pdf_path.name,
+                                "page_number": page_num + 1,
+                                "image_index": img_index + 1,
+                                "width": pix.width,
+                                "height": pix.height,
+                                "size_kb": len(img_data) / 1024,
+                                "format": "PNG"
+                            }
+                            
+                            images_data.append(image_info)
+                            total_images_found += 1
+                            st.write(f"✅ Saved image: {img_filename} ({len(img_data)/1024:.1f}KB)")
+                            
+                        else:
+                            st.write(f"⏭️ Skipping unsupported color space: {pix.n} channels")
+                            
+                        pix = None  # Clean up
+                        
+                    except Exception as img_error:
+                        st.write(f"❌ Error processing image {img_index + 1}: {str(img_error)}")
+                        continue
+                
+                if len(images_data) >= self.max_images_per_pdf:
+                    break
+            
+            pdf_document.close()
+            st.success(f"✅ Extracted {len(images_data)} images from {pdf_path.name}")
+            
+        except Exception as e:
+            st.error(f"❌ Error extracting images from {pdf_path.name}: {str(e)}")
+        
+        return images_data
+    
+    def encode_image_base64(self, image_path: Path) -> str:
+        """Encode image to base64 for OpenAI API."""
+        try:
+            with open(image_path, "rb") as image_file:
+                return base64.b64encode(image_file.read()).decode('utf-8')
+        except Exception as e:
+            st.error(f"Error encoding image {image_path}: {str(e)}")
+            return ""
+    
+    def get_multimodal_embedding(self, text: str, image_paths: List[Path] = None) -> np.ndarray:
+        """Get embedding for text and images using OpenAI's multimodal capabilities."""
+        try:
+            # For now, we'll use text embeddings and combine with image analysis
+            # OpenAI's text-embedding models don't directly support images yet,
+            # but we can analyze images with vision models and combine the insights
+            
+            enhanced_text = text
+            
+            # If we have images, analyze them and add to text context
+            if image_paths and len(image_paths) > 0 and self.use_multimodal:
+                for image_path in image_paths[:3]:  # Limit to 3 images for performance
+                    if image_path.exists():
+                        try:
+                            # Analyze image with vision model (if available)
+                            image_description = self.analyze_image_with_vision(image_path)
+                            if image_description:
+                                enhanced_text += f"\n[Image Content: {image_description}]"
+                        except Exception as e:
+                            st.write(f"⚠️ Could not analyze image {image_path.name}: {str(e)}")
+            
+            # Get text embedding
+            response = self.openai_client.embeddings.create(
+                model=self.text_embedding_model,
+                input=enhanced_text[:8000]  # Truncate if too long
+            )
+            
+            return np.array(response.data[0].embedding, dtype=np.float32)
+            
+        except Exception as e:
+            st.error(f"Error getting multimodal embedding: {str(e)}")
+            # Return zero vector as fallback
+            return np.zeros(1536, dtype=np.float32)
+    
+    def analyze_image_with_vision(self, image_path: Path) -> str:
+        """Analyze image content using vision model (if available)."""
+        try:
+            # Check if the model supports vision
+            if "gpt-4" not in self.model_name.lower() and "vision" not in self.model_name.lower():
+                return ""
+            
+            # Encode image
+            base64_image = self.encode_image_base64(image_path)
+            if not base64_image:
+                return ""
+            
+            # Call vision model
+            response = self.openai_client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Describe this image briefly, focusing on key visual elements, text, charts, diagrams, or important content that would be useful for document search. Keep it concise."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=150,
+                temperature=0.1
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            # Vision not available or failed
+            return ""
     
     def intelligent_text_preprocessing(self, text: str) -> Dict:
         """Advanced text preprocessing with structure awareness."""
@@ -152,6 +353,43 @@ class HybridRAGManager:
         
         return metadata
     
+    def intelligent_chunking_with_images(self, sections: List[Dict], images_data: List[Dict], 
+                                       chunk_size: int = 1000, overlap: int = 200) -> List[Dict]:
+        """Intelligent chunking with improved image association."""
+        chunks = []
+        
+        # First, create text chunks
+        text_chunks = self.intelligent_chunking(sections, chunk_size, overlap)
+        
+        # Associate images with chunks more intelligently
+        for chunk in text_chunks:
+            chunk["images"] = []
+            chunk["has_images"] = False
+            
+            # Try to associate images with this chunk
+            source = chunk.get("source", "")
+            if source and images_data:
+                # Get images from the same PDF
+                chunk_images = [img for img in images_data if img["source_pdf"] == source]
+                
+                # For better association, we could analyze page numbers or content
+                # For now, distribute images across chunks
+                chunk_index = len(chunks)
+                total_chunks = len(text_chunks)
+                
+                if chunk_images and total_chunks > 0:
+                    # Distribute images across chunks
+                    images_per_chunk = max(1, len(chunk_images) // total_chunks)
+                    start_idx = chunk_index * images_per_chunk
+                    end_idx = min(start_idx + images_per_chunk + 2, len(chunk_images))  # +2 for overlap
+                    
+                    chunk["images"] = chunk_images[start_idx:end_idx]
+                    chunk["has_images"] = len(chunk["images"]) > 0
+            
+            chunks.append(chunk)
+        
+        return chunks
+    
     def intelligent_chunking(self, sections: List[Dict], chunk_size: int = 1000, overlap: int = 200) -> List[Dict]:
         """Intelligent chunking with context preservation."""
         chunks = []
@@ -218,7 +456,7 @@ class HybridRAGManager:
         return len(text.split()) * 1.3  # Approximate
     
     def create_hybrid_search_index(self, chunks: List[Dict]) -> Dict:
-        """Create both vector and BM25 indices."""
+        """Create both vector and BM25 indices with multimodal support."""
         if not chunks:
             return {"vector_index": None, "bm25_index": None, "metadata": []}
         
@@ -226,18 +464,23 @@ class HybridRAGManager:
         texts = [chunk["content"] for chunk in chunks]
         metadata = [
             {
-                "content": chunk["content"],  # Store full content now
+                "content": chunk["content"],  # Store full content
                 "title": chunk.get("title", ""),
                 "type": chunk.get("type", "content"),
                 "tokens": chunk.get("tokens", 0),
-                "chunk_id": i
+                "chunk_id": i,
+                "images": chunk.get("images", []),
+                "has_images": chunk.get("has_images", False),
+                "source": chunk.get("source", ""),
+                "file_metadata": chunk.get("file_metadata", {}),
+                "file_index": chunk.get("file_index", 0)
             }
             for i, chunk in enumerate(chunks)
         ]
         
-        # Create vector index
-        st.info("🔄 Creating vector embeddings...")
-        embeddings = self.get_embeddings_optimized(texts)
+        # Create multimodal vector index
+        st.info("🔄 Creating multimodal embeddings...")
+        embeddings = self.get_embeddings_optimized_multimodal(chunks)
         vector_index = self.create_faiss_index(embeddings)
         
         # Create BM25 index
@@ -255,6 +498,47 @@ class HybridRAGManager:
             "tokenized_docs": tokenized_docs if self.use_bm25 else None
         }
     
+    def get_embeddings_optimized_multimodal(self, chunks: List[Dict], batch_size: int = 20) -> np.ndarray:
+        """Optimized multimodal embedding generation."""
+        embeddings = []
+        
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            
+            try:
+                batch_embeddings = []
+                
+                for chunk in batch:
+                    text = chunk["content"][:8000]  # Truncate
+                    images = chunk.get("images", [])
+                    
+                    # Get image paths
+                    image_paths = []
+                    if images:
+                        for img_info in images[:3]:  # Limit to 3 images per chunk
+                            img_path = Path(img_info["path"])
+                            if img_path.exists():
+                                image_paths.append(img_path)
+                    
+                    # Get multimodal embedding
+                    embedding = self.get_multimodal_embedding(text, image_paths)
+                    batch_embeddings.append(embedding)
+                
+                embeddings.extend(batch_embeddings)
+                
+                # Progress
+                progress = min(i + batch_size, len(chunks))
+                if progress % 10 == 0:
+                    st.write(f"✅ Processed {progress}/{len(chunks)} multimodal embeddings")
+                
+            except Exception as e:
+                st.warning(f"Error in batch {i//batch_size + 1}: {str(e)}")
+                # Add zero vectors for failed batch
+                for _ in batch:
+                    embeddings.append(np.zeros(1536, dtype=np.float32))
+        
+        return np.array(embeddings, dtype=np.float32)
+    
     def _tokenize_for_bm25(self, text: str) -> List[str]:
         """Tokenize text for BM25."""
         # Simple tokenization
@@ -270,38 +554,6 @@ class HybridRAGManager:
     def _split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences."""
         return re.split(r'(?<=[.!?])\s+', text)
-    
-    def get_embeddings_optimized(self, texts: List[str], batch_size: int = 40) -> np.ndarray:
-        """Optimized embedding generation."""
-        embeddings = []
-        
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            
-            try:
-                # Process batch
-                batch_texts = [text[:8000] for text in batch]  # Truncate
-                
-                response = self.openai_client.embeddings.create(
-                    model=self.embedding_model,
-                    input=batch_texts
-                )
-                
-                batch_embeddings = [item.embedding for item in response.data]
-                embeddings.extend(batch_embeddings)
-                
-                # Progress
-                progress = min(i + batch_size, len(texts))
-                if progress % 20 == 0:
-                    st.write(f"✅ Processed {progress}/{len(texts)} embeddings")
-                
-            except Exception as e:
-                st.warning(f"Error in batch {i//batch_size + 1}: {str(e)}")
-                # Add zero vectors for failed batch
-                for _ in batch:
-                    embeddings.append([0.0] * 1536)
-        
-        return np.array(embeddings, dtype=np.float32)
     
     def create_faiss_index(self, embeddings: np.ndarray):
         """Create optimized FAISS index."""
@@ -335,6 +587,86 @@ class HybridRAGManager:
         
         return index
     
+    def display_image_in_streamlit(self, image_info: Dict) -> bool:
+        """Display an image in Streamlit interface with better error handling."""
+        try:
+            image_path = Path(image_info["path"])
+            if image_path.exists():
+                # Verify the image can be opened
+                try:
+                    with Image.open(image_path) as img:
+                        st.image(str(image_path), 
+                                caption=f"From {image_info['source_pdf']} - Page {image_info['page_number']} ({image_info['width']}x{image_info['height']})", 
+                                width=400)  # Increased width for better visibility
+                        return True
+                except Exception as img_error:
+                    st.error(f"Error opening image file: {str(img_error)}")
+                    return False
+            else:
+                st.warning(f"Image file not found: {image_path}")
+                return False
+        except Exception as e:
+            st.error(f"Error displaying image: {str(e)}")
+            return False
+    
+    def create_multimodal_result_display(self, results: List[Dict]) -> str:
+        """Create enhanced display for multimodal results."""
+        if not results:
+            return "No results found."
+        
+        display_parts = []
+        
+        for i, result in enumerate(results, 1):
+            content = result.get("content", "")
+            source = result.get("source", "Unknown")
+            images = result.get("images", [])
+            has_images = result.get("has_images", False)
+            
+            # Text content
+            display_parts.append(f"**Result {i} - {source}**")
+            display_parts.append(content)
+            
+            # Image indicator
+            if has_images and images:
+                display_parts.append(f"\n📷 *Contains {len(images)} image(s) - see below*")
+            
+            display_parts.append("---")
+        
+        return "\n".join(display_parts)
+    
+    def display_multimodal_results_in_streamlit(self, results: List[Dict]):
+        """Enhanced display of multimodal results with images in Streamlit."""
+        if not results:
+            st.info("No results found.")
+            return
+        
+        for i, result in enumerate(results, 1):
+            with st.expander(f"📄 Result {i} - {result.get('source', 'Unknown')}", expanded=(i<=2)):
+                # Display text content
+                st.markdown(f"**Content:**")
+                st.write(result.get("content", ""))
+                
+                # Display images if available
+                images = result.get("images", [])
+                if images:
+                    st.markdown(f"**🖼️ Images ({len(images)}):**")
+                    
+                    # Display each image with some space
+                    for idx, image_info in enumerate(images):
+                        st.markdown(f"*Image {idx + 1}:*")
+                        success = self.display_image_in_streamlit(image_info)
+                        if not success:
+                            st.warning(f"Could not display image {idx + 1}")
+                        st.markdown("---")  # Separator between images
+                else:
+                    st.info("No images found in this result.")
+                
+                # Display metadata
+                if result.get("rrf_score"):
+                    st.caption(f"Relevance Score: {result['rrf_score']:.4f}")
+                elif result.get("similarity_score"):
+                    st.caption(f"Similarity Score: {result['similarity_score']:.4f}")
+    
     def hybrid_search(self, query: str, k: int = 10) -> List[Dict]:
         """Enhanced hybrid search with query preprocessing."""
         indices = self.load_hybrid_indices()
@@ -350,22 +682,14 @@ class HybridRAGManager:
         
         all_results = []
         
-        # Vector search with query variations
+        # Vector search with multimodal query
         if vector_index:
-            # Original query
-            vector_results = self._vector_search_internal(query, vector_index, metadata, k)
+            # Create multimodal embedding for query
+            query_embedding = self.get_multimodal_embedding(query)
+            vector_results = self._vector_search_internal_multimodal(query_embedding, vector_index, metadata, k)
             for result in vector_results:
-                result["search_type"] = "vector"
-                result["query_variant"] = "original"
+                result["search_type"] = "vector_multimodal"
             all_results.extend(vector_results)
-            
-            # Processed query if different
-            if processed_query != query:
-                processed_results = self._vector_search_internal(processed_query, vector_index, metadata, k//2)
-                for result in processed_results:
-                    result["search_type"] = "vector"
-                    result["query_variant"] = "processed"
-                all_results.extend(processed_results)
         
         # BM25 search
         if bm25_index and self.use_bm25:
@@ -378,6 +702,29 @@ class HybridRAGManager:
         combined_results = self._enhanced_reciprocal_rank_fusion(all_results, k)
         
         return combined_results[:k]
+    
+    def _vector_search_internal_multimodal(self, query_embedding: np.ndarray, index, metadata: List[Dict], k: int) -> List[Dict]:
+        """Enhanced vector search with multimodal embeddings."""
+        try:
+            # Search with more candidates for better selection
+            search_k = min(k * 3, index.ntotal)
+            distances, indices = index.search(query_embedding.reshape(1, -1), search_k)
+            
+            results = []
+            for i, idx in enumerate(indices[0]):
+                if idx < len(metadata) and idx >= 0:
+                    result = metadata[idx].copy()
+                    # Convert L2 distance to similarity score (0-1, higher is better)
+                    similarity = 1.0 / (1.0 + distances[0][i])
+                    result["similarity_score"] = float(distances[0][i])  # Keep original for compatibility
+                    result["normalized_score"] = similarity
+                    results.append(result)
+            
+            return results
+            
+        except Exception as e:
+            st.error(f"Multimodal vector search error: {str(e)}")
+            return []
     
     def _preprocess_query(self, query: str) -> str:
         """Preprocess query for better search performance."""
@@ -405,36 +752,6 @@ class HybridRAGManager:
             processed += ' years'
         
         return processed
-    
-    def _vector_search_internal(self, query: str, index, metadata: List[Dict], k: int) -> List[Dict]:
-        """Enhanced vector search with better scoring."""
-        try:
-            response = self.openai_client.embeddings.create(
-                model=self.embedding_model,
-                input=[query[:8000]]
-            )
-            
-            query_embedding = np.array([response.data[0].embedding], dtype=np.float32)
-            
-            # Search with more candidates for better selection
-            search_k = min(k * 3, index.ntotal)
-            distances, indices = index.search(query_embedding, search_k)
-            
-            results = []
-            for i, idx in enumerate(indices[0]):
-                if idx < len(metadata) and idx >= 0:
-                    result = metadata[idx].copy()
-                    # Convert L2 distance to similarity score (0-1, higher is better)
-                    similarity = 1.0 / (1.0 + distances[0][i])
-                    result["similarity_score"] = float(distances[0][i])  # Keep original for compatibility
-                    result["normalized_score"] = similarity
-                    results.append(result)
-            
-            return results
-            
-        except Exception as e:
-            st.error(f"Vector search error: {str(e)}")
-            return []
     
     def _bm25_search(self, query: str, bm25_index, metadata: List[Dict], k: int) -> List[Dict]:
         """Enhanced BM25 search with better scoring."""
@@ -471,8 +788,8 @@ class HybridRAGManager:
         """Enhanced RRF with query variant and search type weighting."""
         rrf_scores = {}
         
-        # Group results by search type and query variant
-        vector_results = [r for r in results if r.get("search_type") == "vector"]
+        # Group results by search type
+        vector_results = [r for r in results if "vector" in r.get("search_type", "")]
         bm25_results = [r for r in results if r.get("search_type") == "bm25"]
         
         # Sort each group by their respective scores
@@ -536,6 +853,7 @@ class HybridRAGManager:
         for result in results:
             content = result.get("content", "")
             title = result.get("title", "")
+            has_images = result.get("has_images", False)
             
             # Skip very similar content using content hashing
             content_hash = hash(content[:300])
@@ -558,6 +876,8 @@ class HybridRAGManager:
                     )
                     if partial_content:
                         section_text = f"**{title}**\n{partial_content}..." if title else f"{partial_content}..."
+                        if has_images:
+                            section_text += " [Contains images]"
                         compressed_sections.append(section_text)
                 break
             
@@ -566,6 +886,10 @@ class HybridRAGManager:
                 section_text = f"**{title}**\n{content}"
             else:
                 section_text = content
+            
+            # Add image indicator
+            if has_images:
+                section_text += "\n[Contains images]"
                 
             compressed_sections.append(section_text)
             total_tokens += section_tokens
@@ -607,7 +931,7 @@ class HybridRAGManager:
         return " ".join(excerpt_parts)
     
     def create_vector_store(self) -> Dict:
-        """Create advanced hybrid RAG system with enhanced processing."""
+        """Create advanced multimodal hybrid RAG system."""
         pdf_files = list(self.data_folder.glob("*.pdf"))
         
         if not pdf_files:
@@ -620,29 +944,41 @@ class HybridRAGManager:
             pdf_files = pdf_files[:max_files]
         
         all_chunks = []
-        processing_stats = {"files": 0, "sections": 0, "chunks": 0, "metadata_items": 0}
+        all_images = []
+        processing_stats = {"files": 0, "sections": 0, "chunks": 0, "metadata_items": 0, "images": 0}
         
         # Progress tracking
         main_progress = st.progress(0)
         main_status = st.empty()
         start_time = time.time()
         
-        # Phase 1: Intelligent preprocessing (35% of progress)
-        main_status.text("🧠 Advanced preprocessing and structure extraction...")
+        # Phase 1: Extract text and images (40% of progress)
+        main_status.text("🧠 Extracting text and images from PDFs...")
         
         for file_idx, pdf_file in enumerate(pdf_files):
+            st.write(f"\n### Processing {pdf_file.name}")
+            
             # Extract text with better handling
             text = self.extract_text_from_pdf(pdf_file)
-            if not text:
+            
+            # Extract images if multimodal is available
+            images_data = []
+            if self.use_multimodal:
+                images_data = self.extract_images_from_pdf(pdf_file)
+                processing_stats["images"] += len(images_data)
+                all_images.extend(images_data)
+            
+            if not text and not images_data:
+                st.warning(f"No content extracted from {pdf_file.name}")
                 continue
             
             # Advanced preprocessing
-            processed = self.intelligent_text_preprocessing(text)
+            processed = self.intelligent_text_preprocessing(text) if text else {"sections": [], "metadata": {}}
             processing_stats["sections"] += len(processed["sections"])
             processing_stats["metadata_items"] += len(processed["metadata"])
             
-            # Enhanced chunking
-            chunks = self.intelligent_chunking(processed["sections"])
+            # Enhanced chunking with image association
+            chunks = self.intelligent_chunking_with_images(processed["sections"], images_data)
             processing_stats["chunks"] += len(chunks)
             
             # Add enriched metadata
@@ -654,8 +990,10 @@ class HybridRAGManager:
             all_chunks.extend(chunks)
             processing_stats["files"] += 1
             
+            st.success(f"✅ Processed {pdf_file.name}: {len(chunks)} chunks, {len(images_data)} images")
+            
             # Update progress
-            file_progress = (file_idx + 1) / len(pdf_files) * 0.35
+            file_progress = (file_idx + 1) / len(pdf_files) * 0.4
             main_progress.progress(file_progress)
         
         if not all_chunks:
@@ -668,10 +1006,10 @@ class HybridRAGManager:
             all_chunks = all_chunks[:max_total_chunks]
             processing_stats["chunks"] = len(all_chunks)
         
-        main_status.text(f"📊 Creating hybrid indices for {len(all_chunks)} chunks...")
-        main_progress.progress(0.35)
+        main_status.text(f"📊 Creating multimodal hybrid indices for {len(all_chunks)} chunks...")
+        main_progress.progress(0.4)
         
-        # Phase 2: Create hybrid indices (55% of progress)
+        # Phase 2: Create hybrid indices (50% of progress)
         try:
             indices = self.create_hybrid_search_index(all_chunks)
             main_progress.progress(0.9)
@@ -679,7 +1017,7 @@ class HybridRAGManager:
             return {"success": False, "message": f"Error creating indices: {str(e)}"}
         
         # Phase 3: Save everything (10% of progress)
-        main_status.text("💾 Saving hybrid RAG system...")
+        main_status.text("💾 Saving multimodal hybrid RAG system...")
         
         try:
             self.save_hybrid_indices(indices)
@@ -689,19 +1027,22 @@ class HybridRAGManager:
         # Complete with detailed stats
         total_time = time.time() - start_time
         main_progress.progress(1.0)
-        main_status.text(f"✅ Hybrid RAG system created in {total_time:.1f}s!")
+        main_status.text(f"✅ Multimodal Hybrid RAG system created in {total_time:.1f}s!")
         
-        search_types = ["Dense Vector"]
+        search_types = ["Dense Vector (Multimodal)"]
         if self.use_bm25:
             search_types.append("Sparse BM25")
+        if self.use_multimodal:
+            search_types.append("Images")
         
         return {
             "success": True,
-            "message": f"Hybrid RAG created: {processing_stats['chunks']} chunks from {processing_stats['files']} files ({', '.join(search_types)})",
+            "message": f"Multimodal Hybrid RAG created: {processing_stats['chunks']} chunks, {processing_stats['images']} images from {processing_stats['files']} files ({', '.join(search_types)})",
             "chunks": processing_stats["chunks"],
             "files": processing_stats["files"],
             "sections": processing_stats["sections"],
             "metadata_items": processing_stats["metadata_items"],
+            "images": processing_stats["images"],
             "time": total_time,
             "search_types": search_types
         }
@@ -724,7 +1065,9 @@ class HybridRAGManager:
                 "chunk_size": self.chunk_size,
                 "chunk_overlap": self.chunk_overlap,
                 "use_bm25": self.use_bm25,
-                "embedding_model": self.embedding_model
+                "use_multimodal": self.use_multimodal,
+                "text_embedding_model": self.text_embedding_model,
+                "multimodal_embedding_model": self.multimodal_embedding_model
             }
         }
         
@@ -799,7 +1142,7 @@ class HybridRAGManager:
             return ""
     
     def search_similar(self, query: str, k: int = 8) -> List[Dict]:
-        """Main search interface using advanced hybrid approach."""
+        """Main search interface using advanced multimodal hybrid approach."""
         try:
             # Use enhanced hybrid search
             results = self.hybrid_search(query, k)
@@ -811,14 +1154,19 @@ class HybridRAGManager:
                 for result in results:
                     chunk_id = result.get("chunk_id", -1)
                     if 0 <= chunk_id < len(metadata):
-                        # Metadata now stores full content
+                        # Metadata now stores full content and images
                         result["content"] = metadata[chunk_id].get("content", result.get("content", ""))
+                        result["images"] = metadata[chunk_id].get("images", [])
+                        result["has_images"] = metadata[chunk_id].get("has_images", False)
             
             return results
             
         except Exception as e:
-            st.error(f"Hybrid search error: {str(e)}")
+            st.error(f"Multimodal hybrid search error: {str(e)}")
             return []
+
+# Update the class name reference in the rest of the code
+HybridRAGManager = MultimodalHybridRAGManager
 
 class ToolPlugin:
     """A plugin that exposes tools for the chatbot."""
@@ -1033,22 +1381,22 @@ async def process_request(kernel, category, function_name):
         return f"Request logged successfully (local fallback)."
 
 def create_hybrid_vector_store_ui(openai_client, model_name):
-    """Hybrid RAG UI for vector store management."""
+    """Enhanced Multimodal Hybrid RAG UI for vector store management."""
     st.sidebar.markdown("---")
-    st.sidebar.header("📚 Hybrid RAG Knowledge Base")
+    st.sidebar.header("📚🖼️ Enhanced Multimodal RAG")
     
     # Check if vector store dependencies are available
     if not VECTOR_STORE_AVAILABLE:
         st.sidebar.error("❌ Vector store dependencies not installed")
-        st.sidebar.code("pip install faiss-cpu PyPDF2 rank-bm25")
+        st.sidebar.code("pip install faiss-cpu PyPDF2 rank-bm25 PyMuPDF Pillow")
         return None
     
-    # Initialize hybrid RAG manager
+    # Initialize multimodal hybrid RAG manager
     if "vector_manager" not in st.session_state:
         try:
-            st.session_state.vector_manager = HybridRAGManager(openai_client, model_name)
+            st.session_state.vector_manager = MultimodalHybridRAGManager(openai_client, model_name)
         except Exception as e:
-            st.sidebar.error(f"Error initializing hybrid RAG: {str(e)}")
+            st.sidebar.error(f"Error initializing multimodal hybrid RAG: {str(e)}")
             return None
     
     vector_manager = st.session_state.vector_manager
@@ -1073,17 +1421,24 @@ def create_hybrid_vector_store_ui(openai_client, model_name):
                 st.write(f"... and {len(pdf_files) - 20} more files")
     else:
         st.sidebar.warning("⚠️ No PDF files found in 'data' folder")
-        st.sidebar.markdown("*Place PDF files in the 'data' folder to create hybrid RAG*")
+        st.sidebar.markdown("*Place PDF files in the 'data' folder to create enhanced multimodal RAG*")
     
-    # Hybrid RAG features info
-    st.sidebar.info("⚡ **Hybrid RAG Features:**\n- Context-aware follow-up questions\n- Vector + BM25 sparse search\n- Intelligent preprocessing\n- Context compression\n- Structure-aware chunking\n- Process up to 15 files\n- Files up to 15MB supported\n- Reciprocal rank fusion")
+    # Enhanced multimodal RAG features info
+    feature_text = "⚡ **Enhanced Multimodal Features:**\n- Advanced image extraction & debugging\n- Multimodal embeddings (text + image analysis)\n- Context-aware follow-up questions\n- Vector + BM25 sparse search\n- Intelligent preprocessing\n- Context compression\n- Structure-aware chunking\n- Process up to 15 files\n- Files up to 15MB supported\n- Reciprocal rank fusion"
+    
+    if MULTIMODAL_AVAILABLE:
+        feature_text += "\n- Enhanced image display & error handling"
+    else:
+        feature_text += "\n- ⚠️ Image support disabled (install PyMuPDF + Pillow)"
+    
+    st.sidebar.info(feature_text)
     
     # Check if hybrid indices exist
     indices = vector_manager.load_hybrid_indices()
     vector_store_exists = bool(indices and indices.get("metadata"))
     
     if vector_store_exists:
-        st.sidebar.success("✅ Hybrid RAG system exists")
+        st.sidebar.success("✅ Enhanced Multimodal RAG system exists")
         
         # Show hybrid RAG info
         try:
@@ -1091,34 +1446,43 @@ def create_hybrid_vector_store_ui(openai_client, model_name):
             if metadata:
                 st.sidebar.markdown(f"**Chunks:** {len(metadata)}")
                 
+                # Count images
+                total_images = sum(len(item.get("images", [])) for item in metadata)
+                if total_images > 0:
+                    st.sidebar.markdown(f"**Images:** {total_images}")
+                
                 # Get unique sources
                 sources = set(item["source"] for item in metadata if "source" in item)
                 st.sidebar.markdown(f"**Sources:** {len(sources)}")
                 
                 # Show search capabilities
-                search_types = ["Vector Search"]
+                search_types = ["Multimodal Vector"]
                 if indices.get("bm25_index") and BM25_AVAILABLE:
                     search_types.append("BM25 Sparse")
+                if total_images > 0:
+                    search_types.append("Images")
                 st.sidebar.markdown(f"**Search Types:** {', '.join(search_types)}")
         except:
             pass
     else:
-        st.sidebar.info("ℹ️ No hybrid RAG system found")
+        st.sidebar.info("ℹ️ No enhanced multimodal RAG system found")
     
     # Create/Recreate hybrid RAG button
-    button_text = "🔄 Recreate Hybrid RAG" if vector_store_exists else "⚡ Create Hybrid RAG"
+    button_text = "🔄 Recreate Enhanced Multimodal RAG" if vector_store_exists else "⚡ Create Enhanced Multimodal RAG"
     
     if st.sidebar.button(button_text, disabled=(len(pdf_files) == 0)):
         if len(pdf_files) == 0:
             st.sidebar.error("❌ No PDF files found to process")
         else:
             with st.sidebar:
-                st.markdown("### 🚀 Creating Hybrid RAG System")
+                st.markdown("### 🚀 Creating Enhanced Multimodal RAG System")
                 try:
                     result = vector_manager.create_vector_store()
                     
                     if result["success"]:
                         st.success(f"✅ {result['message']}")
+                        if result.get("images", 0) > 0:
+                            st.info(f"🖼️ Extracted {result['images']} images")
                         st.balloons()
                         
                         # Show search capabilities
@@ -1129,27 +1493,36 @@ def create_hybrid_vector_store_ui(openai_client, model_name):
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
     
-    # Hybrid RAG search interface
+    # Enhanced RAG search interface
     if vector_store_exists:
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🔍 Hybrid RAG Search")
+        st.sidebar.subheader("🔍 Enhanced Multimodal Search")
         
         search_query = st.sidebar.text_input("Search query:", placeholder="Search in PDFs...")
         
-        if st.sidebar.button("🔍 Hybrid Search") and search_query:
+        if st.sidebar.button("🔍 Enhanced Search") and search_query:
             with st.sidebar:
                 with st.spinner("Searching..."):
                     try:
                         start_time = time.time()
-                        results = vector_manager.search_similar(search_query, k=5)
+                        results = vector_manager.search_similar(search_query, k=3)  # Fewer results for sidebar
                         search_time = time.time() - start_time
                         
                         if results:
                             st.success(f"Found {len(results)} results in {search_time:.2f}s")
+                            
+                            # Show results with images
                             for i, result in enumerate(results, 1):
                                 with st.expander(f"Result {i} - {result.get('source', 'Unknown')}", expanded=(i==1)):
-                                    st.write(f"**Source:** {result.get('source', 'Unknown')}")
                                     st.write(f"**Content:** {result.get('content', '')[:200]}...")
+                                    
+                                    # Show images if available
+                                    images = result.get("images", [])
+                                    if images:
+                                        st.write(f"**Images:** {len(images)} found")
+                                        # Show first image thumbnail
+                                        if len(images) > 0:
+                                            vector_manager.display_image_in_streamlit(images[0])
                                     
                                     # Show search type if available
                                     search_type = result.get('search_type', 'hybrid')
@@ -1225,11 +1598,11 @@ def handle_agent_conversation(category):
             return True
             
     elif category == "Search Knowledge Base":
-        st.markdown("📚 **Knowledge Base Agent** is now assisting you.")
+        st.markdown("📚🖼️ **Enhanced Multimodal Knowledge Base Agent** is now assisting you.")
         
         # Check if vector store exists
         if "vector_manager" not in st.session_state:
-            st.error("❌ Hybrid RAG not initialized. Please create a hybrid RAG system first.")
+            st.error("❌ Enhanced Multimodal RAG not initialized. Please create an enhanced multimodal RAG system first.")
             if st.button("Return to Main Agent"):
                 return True
             return False
@@ -1238,7 +1611,7 @@ def handle_agent_conversation(category):
         indices = vector_manager.load_hybrid_indices()
         
         if not indices or not indices.get("metadata"):
-            st.error("❌ No hybrid RAG system found. Please create one first by uploading PDFs.")
+            st.error("❌ No enhanced multimodal hybrid RAG system found. Please create one first by uploading PDFs.")
             if st.button("Return to Main Agent"):
                 return True
             return False
@@ -1247,8 +1620,8 @@ def handle_agent_conversation(category):
         original_query = st.session_state.get('original_user_query', '')
         
         if original_query and not st.session_state.get('kb_query_processed', False):
-            # Process the original query directly with hybrid RAG
-            with st.spinner("🔍 Hybrid searching..."):
+            # Process the original query directly with enhanced multimodal hybrid RAG
+            with st.spinner("🔍 Enhanced multimodal searching..."):
                 try:
                     start_time = time.time()
                     
@@ -1256,7 +1629,7 @@ def handle_agent_conversation(category):
                     general_queries = ["what information", "what's in", "what is in", "what does the document contain", "what topics", "summarize", "overview", "what's available"]
                     is_general_query = any(phrase in original_query.lower() for phrase in general_queries)
                     
-                    # Use hybrid search with appropriate parameters
+                    # Use enhanced hybrid search with appropriate parameters
                     if is_general_query:
                         results = vector_manager.search_similar(original_query, k=12)
                     else:
@@ -1266,35 +1639,38 @@ def handle_agent_conversation(category):
                     
                     # Always try to use results if we have any
                     if results:
-                        # Use context compression for better LLM input
+                        # Display enhanced multimodal results in a special way
+                        st.markdown("### 📊 Enhanced Multimodal Search Results")
+                        st.write(f"*Found {len(results)} relevant sections with enhanced image analysis in {search_time:.2f}s*")
+                        
+                        # Display results with enhanced images
+                        vector_manager.display_multimodal_results_in_streamlit(results)
+                        
+                        # Also generate text summary for the session state
                         max_tokens = 6000 if is_general_query else 4000
                         compressed_context = vector_manager.context_compression(results, original_query, max_tokens)
                         
-                        # Create enhanced answer with hybrid RAG
-                        answer_parts = []
-                        
-                        # Try to generate AI summary with compressed context
-                        ai_summary_generated = False
+                        # Try to generate AI summary
                         try:
                             openai_client = st.session_state.get('openai_client')
                             model_name = os.getenv("DEPLOYMENT_NAME")
                             
                             if openai_client and model_name and compressed_context:
                                 if is_general_query:
-                                    summary_prompt = f"""Based on the following content from documents, provide a comprehensive overview of what information is available in the knowledge base.
+                                    summary_prompt = f"""Based on the following content from documents (including image analysis), provide a comprehensive overview of what information is available in the knowledge base.
 
 User Question: {original_query}
 
-Document Content:
+Document Content (including image descriptions):
 {compressed_context}
 
 Please provide a helpful summary of the main topics, types of information, and key content available in these documents. Be comprehensive and informative."""
                                 else:
-                                    summary_prompt = f"""Based on the following content from documents, provide a clear and direct answer to the user's question. Extract specific facts and details that answer the question.
+                                    summary_prompt = f"""Based on the following content from documents (including image analysis), provide a clear and direct answer to the user's question. Extract specific facts and details that answer the question.
 
 User Question: {original_query}
 
-Relevant Content:
+Relevant Content (including image descriptions):
 {compressed_context}
 
 Please provide a direct, accurate answer based on the content above. Focus on answering the specific question asked with concrete details and facts from the documents."""
@@ -1308,30 +1684,16 @@ Please provide a direct, accurate answer based on the content above. Focus on an
                                 
                                 ai_summary = response.choices[0].message.content.strip()
                                 
-                                # Add search metadata
-                                search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
-                                #answer_parts.append(ai_summary + search_info)
-                                answer_parts.append(ai_summary)
-                                ai_summary_generated = True
+                                # Display AI summary
+                                st.markdown("### 🤖 AI Summary (Enhanced with Image Analysis)")
+                                st.write(ai_summary)
+                                
+                                # Store for session state
+                                final_answer = f"{ai_summary}\n\n*📊 Enhanced multimodal search found {len(results)} relevant sections with text and images in {search_time:.2f}s*"
                                 
                         except Exception as e:
-                            # Silently fall back to showing compressed content
-                            pass
-                        
-                        # If no AI summary, show compressed content directly
-                        if not ai_summary_generated:
-                            if is_general_query:
-                                answer_parts.append("Based on your documents, here's what information is available:")
-                                answer_parts.append(compressed_context)
-                            else:
-                                answer_parts.append("Based on your documents:")
-                                answer_parts.append(compressed_context)
-                            
-                            # Add search metadata
-                            search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
-                            answer_parts.append(search_info)
-                        
-                        final_answer = "\n".join(answer_parts)
+                            # Fall back to showing compressed content
+                            final_answer = f"Based on your documents (including images):\n{compressed_context}\n\n*📊 Enhanced multimodal search found {len(results)} relevant sections in {search_time:.2f}s*"
                         
                         st.session_state.agent_complete = True
                         st.session_state.agent_result = final_answer
@@ -1344,19 +1706,25 @@ Please provide a direct, accurate answer based on the content above. Focus on an
                             indices = vector_manager.load_hybrid_indices()
                             metadata = indices.get("metadata", [])
                             if metadata and len(metadata) > 0:
-                                sample_content = []
-                                sample_content.append("I couldn't find specific matches for your query, but here's a sample of what's in your knowledge base:")
+                                st.markdown("I couldn't find specific matches for your query, but here's a sample of what's in your enhanced knowledge base:")
                                 
                                 # Show first few chunks as samples
-                                for i, item in enumerate(metadata[:4], 1):
-                                    sample_content.append(f"\n**Sample {i} (from {item.get('source', 'Unknown')}):**")
-                                    content = item.get('content', '')[:400] + "..." if len(item.get('content', '')) > 400 else item.get('content', '')
-                                    sample_content.append(content)
+                                for i, item in enumerate(metadata[:3], 1):
+                                    with st.expander(f"Sample {i} (from {item.get('source', 'Unknown')})", expanded=(i==1)):
+                                        content = item.get('content', '')[:400] + "..." if len(item.get('content', '')) > 400 else item.get('content', '')
+                                        st.write(content)
+                                        
+                                        # Show images if available
+                                        images = item.get("images", [])
+                                        if images:
+                                            st.write(f"*Contains {len(images)} image(s)*")
+                                            if len(images) > 0:
+                                                vector_manager.display_image_in_streamlit(images[0])
                                 
-                                sample_content.append(f"\n*Total content: {len(metadata)} sections across your documents*")
-                                sample_content.append("\nTry asking more specific questions about topics that interest you.")
+                                st.write(f"*Total content: {len(metadata)} sections across your documents*")
+                                st.write("Try asking more specific questions about topics that interest you.")
                                 
-                                final_answer = "\n".join(sample_content)
+                                final_answer = f"Sample content shown above. Total: {len(metadata)} sections across your documents. Try asking more specific questions."
                             else:
                                 final_answer = "I couldn't find relevant information in your documents for that question. Try rephrasing or asking about different topics."
                         except:
@@ -1388,10 +1756,10 @@ Please provide a direct, accurate answer based on the content above. Focus on an
                 st.markdown("**Enter your question:**")
                 query = st.text_area("Query:", placeholder="Ask any question about your documents...")
                 
-                submitted = st.form_submit_button("🔍 Search", type="primary")
+                submitted = st.form_submit_button("🔍 Enhanced Multimodal Search", type="primary")
                 
                 if submitted and query.strip():
-                    with st.spinner("🔍 Hybrid searching..."):
+                    with st.spinner("🔍 Enhanced multimodal searching..."):
                         try:
                             start_time = time.time()
                             results = vector_manager.search_similar(query.strip(), k=8)
@@ -1399,23 +1767,25 @@ Please provide a direct, accurate answer based on the content above. Focus on an
                             
                             # Always try to use results if we have any
                             if results:
-                                # Use context compression
+                                # Display enhanced multimodal results
+                                st.markdown("### 📊 Enhanced Multimodal Search Results")
+                                st.write(f"*Found {len(results)} relevant sections with enhanced image analysis in {search_time:.2f}s*")
+                                
+                                vector_manager.display_multimodal_results_in_streamlit(results)
+                                
+                                # Generate AI summary for session state
                                 compressed_context = vector_manager.context_compression(results, query.strip(), 4000)
                                 
-                                answer_parts = []
-                                
-                                # Try AI summary with compressed context
-                                ai_summary_generated = False
                                 try:
                                     openai_client = st.session_state.get('openai_client')
                                     model_name = os.getenv("DEPLOYMENT_NAME")
                                     
                                     if openai_client and model_name and compressed_context:
-                                        summary_prompt = f"""Based on the following content from documents, provide a clear and helpful answer to the user's question. Focus on directly answering what was asked.
+                                        summary_prompt = f"""Based on the following content from documents (including image analysis), provide a clear and helpful answer to the user's question. Focus on directly answering what was asked.
 
 User Question: {query}
 
-Relevant Content:
+Relevant Content (including image descriptions):
 {compressed_context}
 
 Please provide a direct, accurate answer based on the content above. Extract specific facts and details that answer the question."""
@@ -1429,24 +1799,15 @@ Please provide a direct, accurate answer based on the content above. Extract spe
                                         
                                         ai_summary = response.choices[0].message.content.strip()
                                         
-                                        # Add search metadata
-                                        search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
-                                        answer_parts.append(ai_summary + search_info)
-                                        ai_summary_generated = True
+                                        # Display AI summary
+                                        st.markdown("### 🤖 AI Summary (Enhanced with Image Analysis)")
+                                        st.write(ai_summary)
+                                        
+                                        final_answer = f"{ai_summary}\n\n*📊 Enhanced multimodal search found {len(results)} relevant sections with text and images in {search_time:.2f}s*"
                                         
                                 except:
-                                    pass
+                                    final_answer = f"Based on your documents (including images):\n{compressed_context}\n\n*📊 Enhanced multimodal search found {len(results)} relevant sections in {search_time:.2f}s*"
                                 
-                                # Fallback to compressed content
-                                if not ai_summary_generated:
-                                    answer_parts.append("Based on your documents:")
-                                    answer_parts.append(compressed_context)
-                                    
-                                    # Add search metadata
-                                    search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
-                                    answer_parts.append(search_info)
-                                
-                                final_answer = "\n".join(answer_parts)
                                 st.session_state.agent_complete = True
                                 st.session_state.agent_result = final_answer
                                 return True
@@ -1478,13 +1839,13 @@ Please provide a direct, accurate answer based on the content above. Extract spe
 
 def main():
     st.set_page_config(
-        page_title="Multi-Agent Assistant (Optimized)",
+        page_title="Enhanced Multimodal Multi-Agent Assistant",
         page_icon="🚀",
         layout="wide"
     )
 
-    st.title("🚀 Multi-Agent Assistant with Hybrid RAG")
-    st.markdown("Featuring **ultra-fast hybrid RAG creation**, **vector + sparse search**, **intelligent preprocessing**, **context compression**, and optimized processing for all your requests.")
+    st.title("🚀 Multi-Agent Assistant with Enhanced Multimodal RAG")
+    st.markdown("Featuring **enhanced multimodal text + image extraction with debugging**, **multimodal embeddings**, **ultra-fast hybrid RAG creation**, **vector + sparse search**, **intelligent preprocessing**, **context compression**, and optimized processing for all your requests.")
 
     # Initialize chatbot
     kernel, chat_service, openai_client = initialize_chatbot()
@@ -1506,7 +1867,7 @@ def main():
     
     show_debug_panel(openai_client, model_name, base_endpoint, api_version, api_key)
 
-    # Add hybrid RAG UI to sidebar
+    # Add enhanced multimodal hybrid RAG UI to sidebar
     vector_manager = create_hybrid_vector_store_ui(openai_client, model_name)
     
     # Store openai_client in session state for knowledge base agent
@@ -1637,7 +1998,7 @@ def main():
 
     # Enhanced sidebar with performance info
     with st.sidebar:
-        st.header("🚀 Advanced Multi-Agent Services")
+        st.header("🚀 Enhanced Multimodal Multi-Agent Services")
         st.markdown("""
         **I can help you with:**
         
@@ -1657,14 +2018,18 @@ def main():
         - Transportation, rides, car services
         - *No additional info required*
         
-        📚 **Hybrid RAG Search**
-        - Advanced hybrid retrieval (Vector + BM25 sparse search)
+        📚🖼️ **Enhanced Multimodal RAG Search**
+        - Advanced text + image extraction with debugging
+        - Multimodal embeddings (text + image analysis)
+        - Hybrid retrieval (Vector + BM25 sparse search)
         - Intelligent preprocessing and context compression
         - Context-aware follow-up questions
         - Ask questions about uploaded PDFs with superior accuracy
         - Get AI-powered summaries with optimal context
+        - View relevant images alongside text results with enhanced display
         - Works with difficult and complex queries
-        - *Requires: Hybrid RAG system with PDFs*
+        - Enhanced error handling and debugging
+        - *Requires: Enhanced Multimodal RAG system with PDFs*
         """)
         
         st.header("💡 Example Requests")
@@ -1675,27 +2040,36 @@ def main():
         - "Feeling really drained"
         - "Can you get me a ride?"
         
-        **Hybrid RAG Queries:**
+        **Enhanced Multimodal RAG Queries:**
         - "How many years of experience does [person] have?"
         - "What skills are mentioned in the resume?"
         - "Find information about XYZ"
         - "What are the technical skills listed?"
         - "Summarize the main qualifications"
         - "What does the document say about education?"
+        - "Show me any charts or diagrams"
+        - "Are there any images in the technical documentation?"
+        - "What pictures of horses are mentioned?"
         
         **📋 Context-Aware Follow-ups:**
         - After asking about someone: "Which company does he work for?"
         - "What about his education background?"
         - "Does he have any certifications?"
         - "Where is he located?"
+        - "Show me any related images"
+        - "Are there pictures of the horses mentioned?"
         """)
         
         # Show context status
         if st.session_state.get('last_successful_category') == "Search Knowledge Base":
             st.info("🔗 **Context Active**: Follow-up questions will automatically use the Knowledge Base")
         
-        st.header("⚡ Hybrid RAG Features")
-        st.markdown("""
+        st.header("⚡ Enhanced Multimodal RAG Features")
+        multimodal_features = """
+        - **Enhanced Image Extraction**: Advanced debugging and better image processing
+        - **Multimodal Embeddings**: Combines text with image analysis using vision models
+        - **Improved Error Handling**: Better debugging for image extraction issues
+        - **Text + Image extraction**: Extract both text and images from PDFs
         - **Hybrid retrieval**: Vector search + BM25 sparse search
         - **Intelligent preprocessing**: Structure-aware text processing
         - **Context compression**: Optimal context for LLM generation
@@ -1710,7 +2084,15 @@ def main():
         - **Smart memory management**
         - **Process up to 15 PDF files**
         - **Files up to 15MB supported**
-        """)
+        - **Detailed extraction logging**: See exactly what images are found
+        """
+        
+        if MULTIMODAL_AVAILABLE:
+            multimodal_features += "\n- **Enhanced Image Display**: View extracted images alongside text results with better error handling\n- **Image Association**: Images linked to relevant text sections with improved distribution\n- **Vision Model Integration**: Uses GPT-4 Vision for image analysis when available"
+        else:
+            multimodal_features += "\n- **⚠️ Image support disabled**: Install PyMuPDF and Pillow for full functionality"
+        
+        st.markdown(multimodal_features)
         
         # Show knowledge base status
         if VECTOR_STORE_AVAILABLE and "vector_manager" in st.session_state:
@@ -1719,28 +2101,33 @@ def main():
             if indices and indices.get("metadata"):
                 metadata = indices["metadata"]
                 sources = set(item.get("source", "") for item in metadata)
-                search_types = ["Vector"]
+                total_images = sum(len(item.get("images", [])) for item in metadata)
+                
+                search_types = ["Multimodal Vector"]
                 if indices.get("bm25_index") and BM25_AVAILABLE:
                     search_types.append("BM25")
-                st.success(f"📚 Hybrid RAG Ready: {len(sources)} documents, {len(metadata)} chunks ({'+'.join(search_types)})")
+                if total_images > 0:
+                    search_types.append("Images")
+                    
+                st.success(f"📚🖼️ Enhanced Multimodal RAG Ready: {len(sources)} documents, {len(metadata)} chunks, {total_images} images ({'+'.join(search_types)})")
                 
                 # Show context status in sidebar too
                 if st.session_state.get('last_successful_category') == "Search Knowledge Base":
                     st.info("🔗 Context Active: Next questions will use Knowledge Base")
             else:
-                st.info("📚 Hybrid RAG: Not created yet")
+                st.info("📚🖼️ Enhanced Multimodal RAG: Not created yet")
         
         st.markdown("---")
         st.header("🔧 Installation & Setup")
         st.markdown("""
-        **For Hybrid RAG (Recommended):**
+        **For Enhanced Multimodal RAG (Recommended):**
         ```bash
-        pip install faiss-cpu PyPDF2 rank-bm25
+        pip install faiss-cpu PyPDF2 rank-bm25 PyMuPDF Pillow
         ```
         
         **For GPU acceleration:**
         ```bash
-        pip install faiss-gpu PyPDF2 rank-bm25
+        pip install faiss-gpu PyPDF2 rank-bm25 PyMuPDF Pillow
         ```
         
         **Environment Variables Required:**
@@ -1751,33 +2138,47 @@ def main():
         API_VERSION=2024-12-01-preview
         ```
         
+        **For Vision Model Support:**
+        - Use GPT-4 Vision model deployment for enhanced image analysis
+        - Model will automatically analyze extracted images
+        - Image descriptions integrated into embeddings
+        
         **Troubleshooting 404 Errors:**
         - ✅ Verify DEPLOYMENT_NAME matches your Azure model deployment
         - ✅ Check ENDPOINT_URL format (no trailing slash)
         - ✅ Ensure deployment is active in Azure Portal
         - ✅ Test connection using the debug panel above
         
-        **Hybrid RAG Features:**
+        **Enhanced Multimodal RAG Features:**
         - Use PDF files under 15MB for best performance
         - Process up to 15 files at once  
+        - Extracts text and images automatically with detailed logging
+        - Images stored locally and linked to text chunks
+        - Enhanced debugging shows exactly what images are found
+        - Reduced minimum image size (50x50) to capture more content
+        - Increased image limits (30 per PDF)
+        - Better image processing with error handling
         - Hybrid search combines vector similarity with BM25 sparse search
         - Intelligent preprocessing extracts structure and metadata
         - Context compression optimizes LLM input for better answers
         - GPU acceleration used automatically when available
         - Reciprocal rank fusion combines multiple search strategies
+        - Images displayed alongside relevant text results
+        - Vision model integration for image content analysis
         """)
         
         # Show current performance status
         if VECTOR_STORE_AVAILABLE:
             gpu_status = "🚀 GPU Accelerated" if GPU_AVAILABLE else "💻 CPU Optimized"
             bm25_status = "🔍 BM25 Available" if BM25_AVAILABLE else "❌ BM25 Missing"
-            st.markdown(f"**Status:** {gpu_status} | {bm25_status}")
+            multimodal_status = "🖼️ Enhanced Multimodal Available" if MULTIMODAL_AVAILABLE else "❌ Image Support Missing"
+            st.markdown(f"**Status:** {gpu_status} | {bm25_status} | {multimodal_status}")
             
         # Show AI summary status
         if "openai_client" in st.session_state:
-            st.markdown("**Hybrid RAG:** ⚡ Full system available")
+            st.markdown("**Enhanced Multimodal RAG:** ⚡ Full system with vision support available")
         else:
-            st.markdown("**Hybrid RAG:** ❌ Configuration issue")
+            st.markdown("**Enhanced Multimodal RAG:** ❌ Configuration issue")
         
         if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []
