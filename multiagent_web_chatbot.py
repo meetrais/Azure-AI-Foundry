@@ -9,6 +9,366 @@ from semantic_kernel.contents.chat_history import ChatHistory
 from semantic_kernel.functions.kernel_function_decorator import kernel_function
 from dotenv import load_dotenv
 from openai import AzureOpenAI
+from pathlib import Path
+from typing import List, Dict
+import pickle
+import time
+
+# Try to import optional dependencies for vector store
+try:
+    import faiss
+    import numpy as np
+    import PyPDF2
+    VECTOR_STORE_AVAILABLE = True
+    
+    # Check for GPU support
+    try:
+        GPU_AVAILABLE = faiss.get_num_gpus() > 0
+    except:
+        GPU_AVAILABLE = False
+        
+except ImportError:
+    VECTOR_STORE_AVAILABLE = False
+    GPU_AVAILABLE = False
+
+class OptimizedVectorStoreManager:
+    """Highly optimized FAISS vector store manager with performance improvements."""
+    
+    def __init__(self, openai_client, model_name, data_folder="data", vector_store_path="vector_store"):
+        if not VECTOR_STORE_AVAILABLE:
+            raise ImportError("Vector store dependencies not available. Install with: pip install faiss-cpu PyPDF2")
+        
+        self.openai_client = openai_client
+        self.model_name = model_name
+        self.data_folder = Path(data_folder)
+        self.vector_store_path = Path(vector_store_path)
+        self.vector_store_path.mkdir(exist_ok=True)
+        self.data_folder.mkdir(exist_ok=True)
+        
+        # Optimized settings
+        self.use_gpu = GPU_AVAILABLE
+        self.embedding_model = "text-embedding-ada-002"
+        
+        if self.use_gpu:
+            st.info(f"🚀 GPU acceleration enabled! Found {faiss.get_num_gpus()} GPU(s)")
+        else:
+            st.info("💻 Using CPU for vector operations")
+    
+    def extract_text_from_pdf(self, pdf_path: Path) -> str:
+        """Optimized PDF text extraction."""
+        try:
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                # Process more pages but efficiently
+                max_pages = min(100, len(pdf_reader.pages))  # Increased from 50
+                text_parts = []
+                
+                for page in pdf_reader.pages[:max_pages]:
+                    try:
+                        text = page.extract_text()
+                        if text and text.strip():
+                            text_parts.append(text.strip())
+                    except:
+                        continue
+                
+                full_text = "\n".join(text_parts)
+                
+                if len(pdf_reader.pages) > max_pages:
+                    st.info(f"Processed {max_pages} of {len(pdf_reader.pages)} pages")
+                
+                return full_text
+                
+        except Exception as e:
+            st.error(f"Error reading PDF {pdf_path.name}: {str(e)}")
+            return ""
+    
+    def chunk_text(self, text: str, chunk_size: int = 1500, overlap: int = 200) -> List[str]:
+        """Optimized text chunking with better parameters."""
+        if not text.strip():
+            return []
+        
+        # More reasonable limits
+        max_total_length = 100000  # Increased from 30k
+        if len(text) > max_total_length:
+            text = text[:max_total_length]
+            st.info(f"Text truncated to {max_total_length} characters")
+        
+        chunks = []
+        start = 0
+        text_len = len(text)
+        
+        while start < text_len:
+            end = min(start + chunk_size, text_len)
+            
+            # Find a good break point (sentence or paragraph end)
+            if end < text_len:
+                for break_char in ['\n\n', '. ', '! ', '? ']:
+                    break_pos = text.rfind(break_char, start + chunk_size//2, end)
+                    if break_pos > start:
+                        end = break_pos + len(break_char)
+                        break
+            
+            chunk = text[start:end].strip()
+            if chunk and len(chunk) > 100:  # Minimum meaningful chunk size
+                chunks.append(chunk)
+            
+            if end >= text_len:
+                break
+                
+            start = end - overlap
+        
+        # More reasonable chunk limit
+        max_chunks = 100  # Increased from 20
+        if len(chunks) > max_chunks:
+            st.warning(f"Using first {max_chunks} chunks out of {len(chunks)}")
+            chunks = chunks[:max_chunks]
+        
+        return chunks
+    
+    def get_embeddings_batch_optimized(self, texts: List[str], batch_size: int = 50) -> np.ndarray:
+        """Highly optimized batch embedding generation."""
+        if not texts:
+            return np.array([])
+        
+        embeddings = []
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        
+        # Create a single progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        start_time = time.time()
+        
+        for i in range(0, len(texts), batch_size):
+            batch_num = i // batch_size + 1
+            batch = texts[i:i + batch_size]
+            
+            # Update status less frequently
+            status_text.text(f"🔄 Processing batch {batch_num}/{total_batches} ({len(batch)} texts)")
+            
+            try:
+                # Prepare batch with length limits
+                processed_batch = []
+                for text in batch:
+                    # More generous token limit
+                    if len(text) > 8000:
+                        text = text[:8000]
+                    processed_batch.append(text)
+                
+                # Single API call for entire batch
+                response = self.openai_client.embeddings.create(
+                    model=self.embedding_model,
+                    input=processed_batch
+                )
+                
+                # Extract embeddings
+                batch_embeddings = [item.embedding for item in response.data]
+                embeddings.extend(batch_embeddings)
+                
+                # Update progress
+                progress = min((i + batch_size) / len(texts), 1.0)
+                progress_bar.progress(progress)
+                
+            except Exception as e:
+                st.warning(f"Error in batch {batch_num}: {str(e)}")
+                # Add zero vectors for failed batch
+                for _ in batch:
+                    embeddings.append([0.0] * 1536)
+        
+        # Show completion stats
+        elapsed_time = time.time() - start_time
+        status_text.text(f"✅ Generated {len(embeddings)} embeddings in {elapsed_time:.1f}s")
+        progress_bar.progress(1.0)
+        
+        return np.array(embeddings, dtype=np.float32)
+    
+    def create_optimized_index(self, embeddings: np.ndarray):
+        """Create optimized FAISS index."""
+        dimension = embeddings.shape[1]
+        n_vectors = embeddings.shape[0]
+        
+        # Choose index type based on data size
+        if n_vectors < 1000:
+            # Use simple flat index for small datasets
+            index = faiss.IndexFlatL2(dimension)
+        else:
+            # Use IVF index for larger datasets
+            nlist = min(100, n_vectors // 10)
+            quantizer = faiss.IndexFlatL2(dimension)
+            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+            
+            # Train the index
+            index.train(embeddings)
+        
+        # Add vectors to index
+        if self.use_gpu and n_vectors > 500:  # Use GPU for larger datasets
+            try:
+                res = faiss.StandardGpuResources()
+                gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
+                gpu_index.add(embeddings)
+                # Convert back to CPU for saving
+                index = faiss.index_gpu_to_cpu(gpu_index)
+                st.success("🚀 Used GPU acceleration for indexing!")
+            except Exception as e:
+                st.warning(f"GPU indexing failed: {str(e)}, using CPU")
+                index.add(embeddings)
+        else:
+            index.add(embeddings)
+        
+        return index
+    
+    def create_vector_store(self) -> Dict:
+        """Optimized vector store creation with performance improvements."""
+        pdf_files = list(self.data_folder.glob("*.pdf"))
+        
+        if not pdf_files:
+            return {"success": False, "message": "No PDF files found in data folder"}
+        
+        # Process more files but with better memory management
+        max_files = 10  # Increased from 1
+        if len(pdf_files) > max_files:
+            st.warning(f"Processing first {max_files} of {len(pdf_files)} files for optimal performance")
+            pdf_files = pdf_files[:max_files]
+        
+        all_texts = []
+        all_metadata = []
+        
+        # Main progress tracking
+        main_progress = st.progress(0)
+        main_status = st.empty()
+        
+        start_time = time.time()
+        
+        # Phase 1: Extract and chunk text (30% of progress)
+        main_status.text("📄 Extracting and chunking text from PDFs...")
+        
+        for file_idx, pdf_file in enumerate(pdf_files):
+            # Check reasonable file size limit
+            file_size = pdf_file.stat().st_size
+            if file_size > 10 * 1024 * 1024:  # 10MB limit (increased from 1MB)
+                st.warning(f"Large file {pdf_file.name} ({file_size//1024//1024}MB) - processing first 100 pages")
+            
+            # Extract text
+            text = self.extract_text_from_pdf(pdf_file)
+            if not text:
+                continue
+            
+            # Chunk text with optimized parameters
+            chunks = self.chunk_text(text)
+            
+            # Add chunks and metadata
+            for i, chunk in enumerate(chunks):
+                all_texts.append(chunk)
+                all_metadata.append({
+                    "source": pdf_file.name,
+                    "chunk_id": i,
+                    "content": chunk[:300]  # Store more content in metadata
+                })
+            
+            # Update progress
+            file_progress = (file_idx + 1) / len(pdf_files) * 0.3
+            main_progress.progress(file_progress)
+        
+        if not all_texts:
+            return {"success": False, "message": "No text extracted from PDF files"}
+        
+        main_status.text(f"📊 Processing {len(all_texts)} text chunks...")
+        
+        # Phase 2: Generate embeddings (60% of progress)
+        main_progress.progress(0.3)
+        
+        try:
+            embeddings = self.get_embeddings_batch_optimized(all_texts)
+            main_progress.progress(0.9)
+        except Exception as e:
+            return {"success": False, "message": f"Error generating embeddings: {str(e)}"}
+        
+        # Phase 3: Create index (10% of progress)
+        main_status.text("🔧 Creating optimized search index...")
+        
+        try:
+            index = self.create_optimized_index(embeddings)
+            main_progress.progress(0.95)
+        except Exception as e:
+            return {"success": False, "message": f"Error creating index: {str(e)}"}
+        
+        # Phase 4: Save everything
+        main_status.text("💾 Saving vector store...")
+        
+        try:
+            index_path = self.vector_store_path / "faiss_index.bin"
+            metadata_path = self.vector_store_path / "metadata.pkl"
+            
+            faiss.write_index(index, str(index_path))
+            
+            with open(metadata_path, 'wb') as f:
+                pickle.dump(all_metadata, f)
+                
+        except Exception as e:
+            return {"success": False, "message": f"Error saving: {str(e)}"}
+        
+        # Complete
+        total_time = time.time() - start_time
+        main_progress.progress(1.0)
+        main_status.text(f"✅ Vector store created in {total_time:.1f}s!")
+        
+        return {
+            "success": True, 
+            "message": f"Vector store created with {len(all_texts)} chunks from {len(pdf_files)} files in {total_time:.1f}s",
+            "chunks": len(all_texts),
+            "files": len(pdf_files),
+            "time": total_time
+        }
+    
+    def load_vector_store(self) -> tuple:
+        """Load existing vector store."""
+        index_path = self.vector_store_path / "faiss_index.bin"
+        metadata_path = self.vector_store_path / "metadata.pkl"
+        
+        if not (index_path.exists() and metadata_path.exists()):
+            return None, None
+        
+        try:
+            index = faiss.read_index(str(index_path))
+            with open(metadata_path, 'rb') as f:
+                metadata = pickle.load(f)
+            return index, metadata
+        except Exception as e:
+            st.error(f"Error loading vector store: {str(e)}")
+            return None, None
+    
+    def search_similar(self, query: str, k: int = 5) -> List[Dict]:
+        """Optimized similarity search."""
+        index, metadata = self.load_vector_store()
+        
+        if index is None or metadata is None:
+            return []
+        
+        try:
+            # Get query embedding (single query, fast)
+            response = self.openai_client.embeddings.create(
+                model=self.embedding_model,
+                input=[query[:8000]]  # Truncate if needed
+            )
+            
+            query_embedding = np.array([response.data[0].embedding], dtype=np.float32)
+            
+            # Search
+            distances, indices = index.search(query_embedding, min(k, index.ntotal))
+            
+            results = []
+            for i, idx in enumerate(indices[0]):
+                if idx < len(metadata) and idx >= 0:
+                    result = metadata[idx].copy()
+                    result["similarity_score"] = float(distances[0][i])
+                    results.append(result)
+            
+            return results
+            
+        except Exception as e:
+            st.error(f"Search error: {str(e)}")
+            return []
 
 class ToolPlugin:
     """A plugin that exposes tools for the chatbot."""
@@ -179,6 +539,122 @@ async def process_request(kernel, category, function_name):
         st.error(f"Error calling function: {e}")
         return f"Request logged successfully (local fallback)."
 
+def create_optimized_vector_store_ui(openai_client, model_name):
+    """Optimized UI for vector store management."""
+    st.sidebar.markdown("---")
+    st.sidebar.header("📚 Knowledge Base (Optimized)")
+    
+    # Check if vector store dependencies are available
+    if not VECTOR_STORE_AVAILABLE:
+        st.sidebar.error("❌ Vector store dependencies not installed")
+        st.sidebar.code("pip install faiss-cpu PyPDF2")
+        return None
+    
+    # Initialize optimized vector store manager
+    if "vector_manager" not in st.session_state:
+        try:
+            st.session_state.vector_manager = OptimizedVectorStoreManager(openai_client, model_name)
+        except Exception as e:
+            st.sidebar.error(f"Error initializing vector store: {str(e)}")
+            return None
+    
+    vector_manager = st.session_state.vector_manager
+    
+    # Check if data folder exists and show PDF count
+    data_folder = Path("data")
+    pdf_files = list(data_folder.glob("*.pdf")) if data_folder.exists() else []
+    
+    st.sidebar.markdown(f"**PDF Files in Data Folder:** {len(pdf_files)}")
+    
+    # Show improved limits
+    if len(pdf_files) > 10:
+        st.sidebar.warning(f"⚠️ {len(pdf_files)} PDF files found. First 10 will be processed for optimal performance.")
+    
+    if pdf_files:
+        with st.sidebar.expander("📄 Available PDF Files", expanded=False):
+            for i, pdf_file in enumerate(pdf_files[:15]):  # Show more in list
+                status = "✅" if i < 10 else "⏳"
+                file_size = pdf_file.stat().st_size / 1024  # KB
+                st.write(f"{status} {pdf_file.name} ({file_size:.0f}KB)")
+            if len(pdf_files) > 15:
+                st.write(f"... and {len(pdf_files) - 15} more files")
+    else:
+        st.sidebar.warning("⚠️ No PDF files found in 'data' folder")
+        st.sidebar.markdown("*Place PDF files in the 'data' folder to create vector store*")
+    
+    # Optimized performance tips
+    st.sidebar.info("⚡ **Performance Optimized:**\n- Process up to 10 files\n- Files up to 10MB supported\n- Batch embedding generation\n- GPU acceleration when available")
+    
+    # Check if vector store exists
+    vector_store_exists = vector_manager.load_vector_store()[0] is not None
+    
+    if vector_store_exists:
+        st.sidebar.success("✅ Vector store exists")
+        
+        # Show vector store info
+        try:
+            index, metadata = vector_manager.load_vector_store()
+            if index and metadata:
+                st.sidebar.markdown(f"**Chunks:** {len(metadata)}")
+                st.sidebar.markdown(f"**Index Size:** {index.ntotal} vectors")
+                
+                # Get unique sources
+                sources = set(item["source"] for item in metadata)
+                st.sidebar.markdown(f"**Sources:** {len(sources)}")
+        except:
+            pass
+    else:
+        st.sidebar.info("ℹ️ No vector store found")
+    
+    # Create/Recreate vector store button
+    button_text = "🔄 Recreate Vector Store" if vector_store_exists else "⚡ Create Vector Store (Fast)"
+    
+    if st.sidebar.button(button_text, disabled=(len(pdf_files) == 0)):
+        if len(pdf_files) == 0:
+            st.sidebar.error("❌ No PDF files found to process")
+        else:
+            with st.sidebar:
+                st.markdown("### 🚀 Creating Optimized Vector Store")
+                try:
+                    result = vector_manager.create_vector_store()
+                    
+                    if result["success"]:
+                        st.success(f"✅ {result['message']}")
+                        st.balloons()
+                    else:
+                        st.error(f"❌ {result['message']}")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+    
+    # Optimized vector search interface
+    if vector_store_exists:
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔍 Fast Search")
+        
+        search_query = st.sidebar.text_input("Search query:", placeholder="Search in PDFs...")
+        
+        if st.sidebar.button("🔍 Search") and search_query:
+            with st.sidebar:
+                with st.spinner("Searching..."):
+                    try:
+                        start_time = time.time()
+                        results = vector_manager.search_similar(search_query, k=3)
+                        search_time = time.time() - start_time
+                        
+                        if results:
+                            st.success(f"Found {len(results)} results in {search_time:.2f}s")
+                            for i, result in enumerate(results, 1):
+                                with st.expander(f"Result {i} - {result['source']}", expanded=(i==1)):
+                                    st.write(f"**Source:** {result['source']}")
+                                    st.write(f"**Content:** {result['content']}")
+                                    st.write(f"**Similarity:** {result['similarity_score']:.4f}")
+                        else:
+                            st.info("No relevant results found")
+                    except Exception as e:
+                        st.error(f"Search error: {str(e)}")
+    
+    return vector_manager
+
 def handle_agent_conversation(category):
     """Handle specialized agent conversation based on category."""
     
@@ -219,7 +695,7 @@ def handle_agent_conversation(category):
                 return True
                 
     elif category == "Report Fatigue":
-        st.markdown("**Specialized Agent** is now assisting you.")
+        st.markdown("😴 **Specialized Agent** is now assisting you.")
         st.markdown("I'll help you report your fatigue.")
         
         if st.button("Submit Report Fatigue Request", type="primary"):
@@ -242,19 +718,22 @@ def handle_agent_conversation(category):
 
 def main():
     st.set_page_config(
-        page_title="Multi-Agent Assistant",
-        page_icon="🤖",
+        page_title="Multi-Agent Assistant (Optimized)",
+        page_icon="🚀",
         layout="wide"
     )
 
-    st.title("🤖 Multi-Agent Request Assistant")
-    st.markdown("I use specialized AI agents to handle your requests for reporting sickness, reporting fatigue, booking hotels, or booking transportation.")
+    st.title("🚀 Multi-Agent Assistant (Performance Optimized)")
+    st.markdown("Featuring **ultra-fast vector store creation** and optimized AI processing for all your requests.")
 
     # Initialize chatbot
     kernel, chat_service, openai_client = initialize_chatbot()
     
     if kernel is None:
         st.stop()
+
+    # Add optimized vector store UI to sidebar
+    vector_manager = create_optimized_vector_store_ui(openai_client, os.getenv("DEPLOYMENT_NAME"))
 
     # Initialize session state for chat history and agent states
     if "messages" not in st.session_state:
@@ -363,9 +842,9 @@ def main():
             
             st.rerun()
 
-    # Sidebar with information
+    # Enhanced sidebar with performance info
     with st.sidebar:
-        st.header("🔧 Available Services")
+        st.header("🚀 Performance Optimized Services")
         st.markdown("""
         **I can help you with:**
         
@@ -394,13 +873,41 @@ def main():
         - "Can you get me a ride?"
         """)
         
-        st.header("🤖 Multi-Agent Features")
+        st.header("⚡ Performance Features")
         st.markdown("""
-        - **Intelligent categorization** using AI
-        - **Specialized agents** for each request type
-        - **Streamlined workflows** with minimal input
-        - **Date collection** for relevant requests
+        - **Ultra-fast** vector store creation
+        - **Batch processing** for embeddings
+        - **GPU acceleration** when available
+        - **Optimized chunking** and indexing
+        - **Smart memory management**
+        - **Process up to 10 PDF files**
+        - **Files up to 10MB supported**
         """)
+        
+        st.markdown("---")
+        st.header("🔧 Installation & Setup")
+        st.markdown("""
+        **For CPU-only (Recommended):**
+        ```bash
+        pip install faiss-cpu PyPDF2
+        ```
+        
+        **For GPU acceleration:**
+        ```bash
+        pip install faiss-gpu PyPDF2
+        ```
+        
+        **Performance Tips:**
+        - Use PDF files under 10MB for best performance
+        - Process up to 10 files at once
+        - GPU acceleration used automatically when available
+        - Optimized batch processing for fast embedding generation
+        """)
+        
+        # Show current performance status
+        if VECTOR_STORE_AVAILABLE:
+            gpu_status = "🚀 GPU Accelerated" if GPU_AVAILABLE else "💻 CPU Optimized"
+            st.markdown(f"**Status:** {gpu_status}")
         
         if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []

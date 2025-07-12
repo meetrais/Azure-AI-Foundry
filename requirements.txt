@@ -7,3 +7,5 @@ streamlit==1.28.1
 semantic-kernel>=0.9.0
 python-dotenv==1.0.0
 asyncio
+faiss-cpu
+PyPDF2
