@@ -83,13 +83,13 @@ class OptimizedVectorStoreManager:
             st.error(f"Error reading PDF {pdf_path.name}: {str(e)}")
             return ""
     
-    def chunk_text(self, text: str, chunk_size: int = 1500, overlap: int = 200) -> List[str]:
-        """Optimized text chunking with better parameters."""
+    def chunk_text(self, text: str, chunk_size: int = 1200, overlap: int = 300) -> List[str]:
+        """Optimized text chunking with better parameters for RAG."""
         if not text.strip():
             return []
         
         # More reasonable limits
-        max_total_length = 100000  # Increased from 30k
+        max_total_length = 100000
         if len(text) > max_total_length:
             text = text[:max_total_length]
             st.info(f"Text truncated to {max_total_length} characters")
@@ -103,14 +103,14 @@ class OptimizedVectorStoreManager:
             
             # Find a good break point (sentence or paragraph end)
             if end < text_len:
-                for break_char in ['\n\n', '. ', '! ', '? ']:
+                for break_char in ['\n\n', '. ', '! ', '? ', '\n']:
                     break_pos = text.rfind(break_char, start + chunk_size//2, end)
                     if break_pos > start:
                         end = break_pos + len(break_char)
                         break
             
             chunk = text[start:end].strip()
-            if chunk and len(chunk) > 100:  # Minimum meaningful chunk size
+            if chunk and len(chunk) > 50:  # Lower minimum chunk size
                 chunks.append(chunk)
             
             if end >= text_len:
@@ -119,7 +119,7 @@ class OptimizedVectorStoreManager:
             start = end - overlap
         
         # More reasonable chunk limit
-        max_chunks = 100  # Increased from 20
+        max_chunks = 150  # Increased for better coverage
         if len(chunks) > max_chunks:
             st.warning(f"Using first {max_chunks} chunks out of {len(chunks)}")
             chunks = chunks[:max_chunks]
@@ -338,24 +338,73 @@ class OptimizedVectorStoreManager:
             st.error(f"Error loading vector store: {str(e)}")
             return None, None
     
-    def search_similar(self, query: str, k: int = 5) -> List[Dict]:
-        """Optimized similarity search."""
+    def enhanced_search_similar(self, query: str, k: int = 5) -> List[Dict]:
+        """Enhanced similarity search with multiple strategies for better RAG quality."""
         index, metadata = self.load_vector_store()
         
         if index is None or metadata is None:
             return []
         
         try:
-            # Get query embedding (single query, fast)
+            # Strategy 1: Direct vector search with original query
+            results = self._vector_search(query, k * 2)  # Get more results initially
+            
+            # Strategy 2: Query expansion for better matching
+            expanded_queries = self._expand_query(query)
+            for expanded_query in expanded_queries:
+                expanded_results = self._vector_search(expanded_query, k)
+                results.extend(expanded_results)
+            
+            # Strategy 3: Keyword-based fallback search
+            keyword_results = self._keyword_search(query, metadata, k)
+            results.extend(keyword_results)
+            
+            # Remove duplicates and sort by relevance
+            seen_indices = set()
+            unique_results = []
+            for result in results:
+                idx = result.get('chunk_id', -1)
+                source = result.get('source', '')
+                key = f"{source}_{idx}"
+                if key not in seen_indices:
+                    seen_indices.add(key)
+                    unique_results.append(result)
+            
+            # Sort by similarity score (lower is better for L2 distance)
+            unique_results.sort(key=lambda x: x.get('similarity_score', float('inf')))
+            
+            # Return top k results with more lenient threshold
+            return unique_results[:k]
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "404" in error_msg or "DeploymentNotFound" in error_msg:
+                st.error("❌ Embedding service unavailable - check your Azure OpenAI deployment configuration")
+            elif "401" in error_msg:
+                st.error("❌ Authentication failed - check your API key and endpoint")
+            else:
+                st.error(f"❌ Search error: {error_msg}")
+            return []
+    
+    def _vector_search(self, query: str, k: int) -> List[Dict]:
+        """Perform vector similarity search."""
+        index, metadata = self.load_vector_store()
+        
+        if index is None or metadata is None:
+            return []
+        
+        try:
+            # Get query embedding
             response = self.openai_client.embeddings.create(
                 model=self.embedding_model,
-                input=[query[:8000]]  # Truncate if needed
+                input=[query[:8000]]
             )
             
             query_embedding = np.array([response.data[0].embedding], dtype=np.float32)
             
-            # Search
-            distances, indices = index.search(query_embedding, min(k, index.ntotal))
+            # Search with larger k to get more candidates
+            search_k = min(k * 3, index.ntotal)
+            distances, indices = index.search(query_embedding, search_k)
             
             results = []
             for i, idx in enumerate(indices[0]):
@@ -366,9 +415,85 @@ class OptimizedVectorStoreManager:
             
             return results
             
-        except Exception as e:
-            st.error(f"Search error: {str(e)}")
+        except Exception:
             return []
+    
+    def _expand_query(self, query: str) -> List[str]:
+        """Expand query with synonyms and variations for better matching."""
+        expanded = []
+        
+        # Common expansions for CV/resume queries
+        experience_terms = ["experience", "years", "work", "career", "professional", "background"]
+        skill_terms = ["skills", "technologies", "expertise", "proficient", "knowledge"]
+        education_terms = ["education", "degree", "university", "college", "study"]
+        
+        query_lower = query.lower()
+        
+        # Expand experience-related queries
+        if any(term in query_lower for term in ["experience", "years"]):
+            expanded.extend([
+                "professional experience years",
+                "work experience career",
+                "years of experience",
+                "professional background"
+            ])
+        
+        # Expand skill-related queries  
+        if any(term in query_lower for term in ["skill", "technology", "tech"]):
+            expanded.extend([
+                "technical skills technologies",
+                "expertise proficient",
+                "programming languages tools"
+            ])
+        
+        # Expand education queries
+        if any(term in query_lower for term in ["education", "degree", "study"]):
+            expanded.extend([
+                "education degree university",
+                "academic background",
+                "qualifications studies"
+            ])
+        
+        # Add simplified versions
+        words = query.split()
+        if len(words) > 2:
+            # Try with just the key terms
+            key_words = [w for w in words if len(w) > 3 and w.lower() not in ["what", "how", "many", "does", "have", "the", "is"]]
+            if key_words:
+                expanded.append(" ".join(key_words))
+        
+        return expanded[:3]  # Limit to 3 expansions
+    
+    def _keyword_search(self, query: str, metadata: List[Dict], k: int) -> List[Dict]:
+        """Fallback keyword-based search for when vector search fails."""
+        query_words = query.lower().split()
+        query_words = [w for w in query_words if len(w) > 2]  # Filter short words
+        
+        scored_results = []
+        
+        for i, item in enumerate(metadata):
+            content = item.get('content', '').lower()
+            
+            # Simple keyword matching score
+            score = 0
+            for word in query_words:
+                if word in content:
+                    score += content.count(word)
+            
+            if score > 0:
+                result = item.copy()
+                result['similarity_score'] = 1.0 / (score + 1)  # Convert to similarity format (lower is better)
+                result['search_type'] = 'keyword'
+                scored_results.append(result)
+        
+        # Sort by score (lower similarity_score is better)
+        scored_results.sort(key=lambda x: x['similarity_score'])
+        
+        return scored_results[:k]
+    
+    def search_similar(self, query: str, k: int = 5) -> List[Dict]:
+        """Main search function - use enhanced search."""
+        return self.enhanced_search_similar(query, k)
 
 class ToolPlugin:
     """A plugin that exposes tools for the chatbot."""
@@ -404,6 +529,14 @@ class ToolPlugin:
         """Placeholder function to handle reporting fatigue."""
         return "Request to report fatigue has been logged."
 
+    @kernel_function(
+        description="Handles knowledge base queries and document searches.",
+        name="search_knowledge_base"
+    )
+    def search_knowledge_base(self):
+        """Placeholder function to handle knowledge base searches."""
+        return "Knowledge base search request has been logged."
+
 def create_tool_dict(metadata):
     """Convert KernelFunctionMetadata to dictionary format for tools."""
     return {
@@ -420,7 +553,14 @@ def create_tool_dict(metadata):
     }
 
 def categorize_with_direct_openai(openai_client, user_input, model_name):
-    """Use direct OpenAI client to categorize user input."""
+    """Use direct OpenAI client to categorize user input with context awareness."""
+    
+    # Check conversation context - if last interaction was Knowledge Base, be more likely to route there
+    last_category = st.session_state.get('last_successful_category', None)
+    context_hint = ""
+    
+    if last_category == "Search Knowledge Base":
+        context_hint = "\n\nNote: The previous interaction was about searching documents/knowledge base, so follow-up questions about the same topic should likely be categorized as 'Search Knowledge Base'."
     
     categorization_prompt = f"""You are a categorization assistant. Analyze the user's request and determine which category it belongs to.
 
@@ -429,14 +569,17 @@ Available categories:
 2. Report Fatigue - for tiredness, exhaustion, fatigue, being worn out, sleepiness, energy issues
 3. Book Hotel - for hotel bookings, accommodation requests, room reservations, lodging
 4. Book Limo - for transportation requests, ride bookings, car services, taxi requests, travel
+5. Search Knowledge Base - for questions about documents, PDFs, information lookup, research queries, asking about specific content, "what does the document say", "find information about", "search for", follow-up questions about people/entities mentioned in documents, questions using pronouns like "he/she/they" that refer to document content, company information, personal details, qualifications, skills, experience details
 
-User request: "{user_input}"
+User request: "{user_input}"{context_hint}
 
 Rules:
-- Respond with ONLY the exact category name (e.g., "Report Sick")
+- Respond with ONLY the exact category name (e.g., "Report Sick" or "Search Knowledge Base")
 - If the request doesn't clearly match any category, respond with "no_match"
 - Do not provide explanations or additional text
 - Be flexible in understanding different ways people might express these needs
+- Pay special attention to follow-up questions that might refer to document content
+- Questions about specific people, their details, work, skills, etc. should go to "Search Knowledge Base"
 
 Category:"""
 
@@ -453,7 +596,7 @@ Category:"""
         category = response.choices[0].message.content.strip()
         
         # Validate the response is one of our expected categories
-        valid_categories = ["Report Sick", "Report Fatigue", "Book Hotel", "Book Limo", "no_match"]
+        valid_categories = ["Report Sick", "Report Fatigue", "Book Hotel", "Book Limo", "Search Knowledge Base", "no_match"]
         
         if category in valid_categories:
             return category if category != "no_match" else None
@@ -468,7 +611,15 @@ Category:"""
                 return "Book Hotel"
             elif "limo" in category_lower or "transport" in category_lower or "ride" in category_lower:
                 return "Book Limo"
+            elif "search" in category_lower or "document" in category_lower or "find" in category_lower or "knowledge" in category_lower or "what" in category_lower:
+                return "Search Knowledge Base"
             else:
+                # Enhanced fallback logic with context awareness
+                if last_category == "Search Knowledge Base":
+                    # If previous was KB and current has question words or pronouns, likely KB
+                    question_indicators = ["what", "who", "where", "when", "how", "which", "he", "she", "they", "company", "work", "job", "does", "is", "are"]
+                    if any(indicator in user_input.lower().split() for indicator in question_indicators):
+                        return "Search Knowledge Base"
                 return None
                 
     except Exception as e:
@@ -491,14 +642,6 @@ def initialize_chatbot():
         base_endpoint = endpoint.split("/openai/deployments/")[0]
     else:
         base_endpoint = endpoint
-
-    # Show configuration in sidebar for debugging
-    with st.sidebar:
-        with st.expander("🔧 Configuration Debug", expanded=False):
-            st.write(f"**Endpoint:** {base_endpoint}")
-            st.write(f"**Model:** {model_name}")
-            st.write(f"**API Version:** {api_version}")
-            st.write(f"**API Key:** {'✅ Present' if api_key else '❌ Missing'}")
 
     # Validate configuration
     if not base_endpoint or not api_key or not model_name:
@@ -526,6 +669,31 @@ def initialize_chatbot():
 
     return kernel, chat_service, openai_client
 
+def show_debug_panel(openai_client, model_name, base_endpoint, api_version, api_key):
+    """Show debug panel with configuration and test connection."""
+    with st.sidebar:
+        with st.expander("🔧 Configuration Debug", expanded=False):
+            st.write(f"**Endpoint:** {base_endpoint}")
+            st.write(f"**Model:** {model_name}")
+            st.write(f"**API Version:** {api_version}")
+            st.write(f"**API Key:** {'✅ Present' if api_key else '❌ Missing'}")
+            
+            # Test connection
+            if st.button("🧪 Test Connection"):
+                try:
+                    test_response = openai_client.chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "user", "content": "test"}],
+                        max_tokens=5
+                    )
+                    st.success("✅ Connection successful!")
+                except Exception as e:
+                    st.error(f"❌ Connection failed: {str(e)}")
+                    if "404" in str(e):
+                        st.warning("💡 Check your DEPLOYMENT_NAME in environment variables")
+                    elif "401" in str(e):
+                        st.warning("💡 Check your API key and endpoint URL")
+
 async def process_request(kernel, category, function_name):
     """Process the user request and call the appropriate function."""
     try:
@@ -540,9 +708,9 @@ async def process_request(kernel, category, function_name):
         return f"Request logged successfully (local fallback)."
 
 def create_optimized_vector_store_ui(openai_client, model_name):
-    """Optimized UI for vector store management."""
+    """Enhanced RAG UI for vector store management."""
     st.sidebar.markdown("---")
-    st.sidebar.header("📚 Knowledge Base (Optimized)")
+    st.sidebar.header("📚 Enhanced RAG Knowledge Base")
     
     # Check if vector store dependencies are available
     if not VECTOR_STORE_AVAILABLE:
@@ -582,8 +750,8 @@ def create_optimized_vector_store_ui(openai_client, model_name):
         st.sidebar.warning("⚠️ No PDF files found in 'data' folder")
         st.sidebar.markdown("*Place PDF files in the 'data' folder to create vector store*")
     
-    # Optimized performance tips
-    st.sidebar.info("⚡ **Performance Optimized:**\n- Process up to 10 files\n- Files up to 10MB supported\n- Batch embedding generation\n- GPU acceleration when available")
+    # Enhanced RAG performance tips
+    st.sidebar.info("⚡ **Enhanced RAG Features:**\n- Context-aware follow-up questions\n- Multi-strategy search (vector + keyword + expansion)\n- Process up to 10 files\n- Files up to 10MB supported\n- Better chunking with overlap\n- Query expansion for better matching\n- Lenient similarity thresholds")
     
     # Check if vector store exists
     vector_store_exists = vector_manager.load_vector_store()[0] is not None
@@ -607,14 +775,14 @@ def create_optimized_vector_store_ui(openai_client, model_name):
         st.sidebar.info("ℹ️ No vector store found")
     
     # Create/Recreate vector store button
-    button_text = "🔄 Recreate Vector Store" if vector_store_exists else "⚡ Create Vector Store (Fast)"
+    button_text = "🔄 Recreate Enhanced RAG Store" if vector_store_exists else "⚡ Create Enhanced RAG Store"
     
     if st.sidebar.button(button_text, disabled=(len(pdf_files) == 0)):
         if len(pdf_files) == 0:
             st.sidebar.error("❌ No PDF files found to process")
         else:
             with st.sidebar:
-                st.markdown("### 🚀 Creating Optimized Vector Store")
+                st.markdown("### 🚀 Creating Enhanced RAG System")
                 try:
                     result = vector_manager.create_vector_store()
                     
@@ -626,14 +794,14 @@ def create_optimized_vector_store_ui(openai_client, model_name):
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
     
-    # Optimized vector search interface
+    # Enhanced RAG search interface
     if vector_store_exists:
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🔍 Fast Search")
+        st.sidebar.subheader("🔍 Enhanced RAG Search")
         
         search_query = st.sidebar.text_input("Search query:", placeholder="Search in PDFs...")
         
-        if st.sidebar.button("🔍 Search") and search_query:
+        if st.sidebar.button("🔍 Enhanced Search") and search_query:
             with st.sidebar:
                 with st.spinner("Searching..."):
                     try:
@@ -713,6 +881,254 @@ def handle_agent_conversation(category):
             st.session_state.agent_complete = True
             st.session_state.agent_result = "✅ Transportation booking request has been logged successfully."
             return True
+            
+    elif category == "Search Knowledge Base":
+        st.markdown("📚 **Knowledge Base Agent** is now assisting you.")
+        
+        # Check if vector store exists
+        if "vector_manager" not in st.session_state:
+            st.error("❌ Vector store not initialized. Please create a vector store first.")
+            if st.button("Return to Main Agent"):
+                return True
+            return False
+        
+        vector_manager = st.session_state.vector_manager
+        index, metadata = vector_manager.load_vector_store()
+        
+        if index is None or metadata is None:
+            st.error("❌ No vector store found. Please create a vector store first by uploading PDFs.")
+            if st.button("Return to Main Agent"):
+                return True
+            return False
+        
+        # Check if we have the original user query from routing
+        original_query = st.session_state.get('original_user_query', '')
+        
+        if original_query and not st.session_state.get('kb_query_processed', False):
+            # Process the original query directly
+            with st.spinner("🔍 Searching..."):
+                try:
+                    start_time = time.time()
+                    
+                    # Check if this is a general query about the knowledge base
+                    general_queries = ["what information", "what's in", "what is in", "what does the document contain", "what topics", "summarize", "overview", "what's available"]
+                    is_general_query = any(phrase in original_query.lower() for phrase in general_queries)
+                    
+                    if is_general_query:
+                        # For general queries, get more results
+                        results = vector_manager.search_similar(original_query, k=15)
+                        similarity_threshold = 5.0  # Very lenient for general queries
+                    else:
+                        # For specific queries, use enhanced search
+                        results = vector_manager.search_similar(original_query, k=10)
+                        similarity_threshold = 3.0  # Much more lenient
+                    
+                    search_time = time.time() - start_time
+                    
+                    # Always try to use results if we have any, regardless of similarity score
+                    if results:
+                        # Create a simple, clean answer
+                        answer_parts = []
+                        
+                        # Try to generate AI summary first
+                        ai_summary_generated = False
+                        try:
+                            openai_client = st.session_state.get('openai_client')
+                            model_name = os.getenv("DEPLOYMENT_NAME")
+                            
+                            if openai_client and model_name:
+                                # Use more content for better context
+                                num_contexts = 6 if is_general_query else 4
+                                context = "\n\n".join([r['content'] for r in results[:num_contexts]])
+                                if len(context) > 8000:  # Increased limit
+                                    context = context[:8000] + "..."
+                                
+                                if is_general_query:
+                                    summary_prompt = f"""Based on the following content from documents, provide a comprehensive overview of what information is available in the knowledge base.
+
+User Question: {original_query}
+
+Document Content:
+{context}
+
+Please provide a helpful summary of the main topics, types of information, and key content available in these documents. Be comprehensive and informative."""
+                                else:
+                                    summary_prompt = f"""Based on the following content from documents, provide a clear and helpful answer to the user's question. Focus on directly answering what was asked.
+
+User Question: {original_query}
+
+Relevant Content:
+{context}
+
+Please provide a direct, accurate answer based on the content above. Extract specific facts and details that answer the question."""
+
+                                response = openai_client.chat.completions.create(
+                                    model=model_name,
+                                    messages=[{"role": "user", "content": summary_prompt}],
+                                    temperature=0.1,  # Lower temperature for more factual responses
+                                    max_tokens=700
+                                )
+                                
+                                ai_summary = response.choices[0].message.content.strip()
+                                answer_parts.append(ai_summary)
+                                ai_summary_generated = True
+                                
+                        except Exception as e:
+                            # Silently fall back to showing raw results
+                            pass
+                        
+                        # If no AI summary, show the most relevant content
+                        if not ai_summary_generated:
+                            if is_general_query:
+                                answer_parts.append("Based on your documents, here's what information is available:")
+                                # Show more results for general queries
+                                for i, result in enumerate(results[:5], 1):
+                                    answer_parts.append(f"\n**Section {i} (from {result['source']}):**")
+                                    # Show more content for overview
+                                    content = result['content'][:500] + "..." if len(result['content']) > 500 else result['content']
+                                    answer_parts.append(content)
+                            else:
+                                answer_parts.append("Based on your documents:")
+                                # Show top 3 results with full content
+                                for i, result in enumerate(results[:3], 1):
+                                    answer_parts.append(f"\n**From {result['source']}:**")
+                                    answer_parts.append(result['content'])
+                        
+                        final_answer = "\n".join(answer_parts)
+                        
+                        st.session_state.agent_complete = True
+                        st.session_state.agent_result = final_answer
+                        st.session_state.kb_query_processed = True
+                        return True
+                        
+                    else:
+                        # If no results found, show sample content from the knowledge base
+                        try:
+                            index, metadata = vector_manager.load_vector_store()
+                            if metadata and len(metadata) > 0:
+                                sample_content = []
+                                sample_content.append("I couldn't find specific matches for your query, but here's a sample of what's in your knowledge base:")
+                                
+                                # Show first few chunks as samples
+                                for i, item in enumerate(metadata[:4], 1):
+                                    sample_content.append(f"\n**Sample {i} (from {item['source']}):**")
+                                    content = item['content'][:400] + "..." if len(item['content']) > 400 else item['content']
+                                    sample_content.append(content)
+                                
+                                sample_content.append(f"\n*Total content: {len(metadata)} sections across your documents*")
+                                sample_content.append("\nTry asking more specific questions about topics that interest you.")
+                                
+                                final_answer = "\n".join(sample_content)
+                            else:
+                                final_answer = "I couldn't find relevant information in your documents for that question. Try rephrasing or asking about different topics."
+                        except:
+                            final_answer = "I couldn't find relevant information in your documents for that question. Try rephrasing or asking about different topics."
+                        
+                        st.session_state.agent_complete = True
+                        st.session_state.agent_result = final_answer
+                        st.session_state.kb_query_processed = True
+                        return True
+                        
+                except Exception as e:
+                    # Handle search failures gracefully
+                    error_msg = str(e)
+                    if "404" in error_msg or "DeploymentNotFound" in error_msg:
+                        fallback_answer = "I'm unable to search your documents due to a configuration issue with the AI service. Please check your Azure OpenAI deployment settings."
+                    elif "401" in error_msg:
+                        fallback_answer = "I'm unable to search your documents due to authentication issues. Please check your API credentials."
+                    else:
+                        fallback_answer = f"I encountered an error while searching your documents: {error_msg}"
+                    
+                    st.session_state.agent_complete = True
+                    st.session_state.agent_result = fallback_answer
+                    st.session_state.kb_query_processed = True
+                    return True
+        
+        else:
+            # Show form for additional queries
+            with st.form("knowledge_query_form"):
+                st.markdown("**Enter your question:**")
+                query = st.text_area("Query:", placeholder="Ask any question about your documents...")
+                
+                submitted = st.form_submit_button("🔍 Search", type="primary")
+                
+                if submitted and query.strip():
+                    with st.spinner("🔍 Searching..."):
+                        try:
+                            results = vector_manager.search_similar(query.strip(), k=8)
+                            
+                            # Always try to use results if we have any
+                            if results:
+                                answer_parts = []
+                                
+                                # Try AI summary first
+                                ai_summary_generated = False
+                                try:
+                                    openai_client = st.session_state.get('openai_client')
+                                    model_name = os.getenv("DEPLOYMENT_NAME")
+                                    
+                                    if openai_client and model_name:
+                                        context = "\n\n".join([r['content'] for r in results[:4]])
+                                        if len(context) > 8000:
+                                            context = context[:8000] + "..."
+                                        
+                                        summary_prompt = f"""Based on the following content from documents, provide a clear and helpful answer to the user's question. Focus on directly answering what was asked.
+
+User Question: {query}
+
+Relevant Content:
+{context}
+
+Please provide a direct, accurate answer based on the content above. Extract specific facts and details that answer the question."""
+
+                                        response = openai_client.chat.completions.create(
+                                            model=model_name,
+                                            messages=[{"role": "user", "content": summary_prompt}],
+                                            temperature=0.1,
+                                            max_tokens=700
+                                        )
+                                        
+                                        ai_summary = response.choices[0].message.content.strip()
+                                        answer_parts.append(ai_summary)
+                                        ai_summary_generated = True
+                                        
+                                except:
+                                    pass
+                                
+                                # Fallback to raw results
+                                if not ai_summary_generated:
+                                    answer_parts.append("Based on your documents:")
+                                    for i, result in enumerate(results[:3], 1):
+                                        answer_parts.append(f"\n**From {result['source']}:**")
+                                        answer_parts.append(result['content'])
+                                
+                                final_answer = "\n".join(answer_parts)
+                                st.session_state.agent_complete = True
+                                st.session_state.agent_result = final_answer
+                                return True
+                                
+                            else:
+                                st.session_state.agent_complete = True
+                                st.session_state.agent_result = "I couldn't find relevant information in your documents for that question."
+                                return True
+                                
+                        except Exception as e:
+                            error_msg = str(e)
+                            if "404" in error_msg or "DeploymentNotFound" in error_msg:
+                                fallback_answer = "I'm unable to search your documents due to a configuration issue with the AI service."
+                            elif "401" in error_msg:
+                                fallback_answer = "I'm unable to search your documents due to authentication issues."
+                            else:
+                                fallback_answer = f"I encountered an error while searching: {error_msg}"
+                            
+                            st.session_state.agent_complete = True
+                            st.session_state.agent_result = fallback_answer
+                            return True
+        
+        # Option to ask another question
+        if st.button("🔄 Ask Another Question"):
+            st.session_state.kb_query_processed = False
+            st.rerun()
     
     return False
 
@@ -723,17 +1139,34 @@ def main():
         layout="wide"
     )
 
-    st.title("🚀 Multi-Agent Assistant (Performance Optimized)")
-    st.markdown("Featuring **ultra-fast vector store creation** and optimized AI processing for all your requests.")
+    st.title("🚀 Multi-Agent Assistant with Enhanced RAG")
+    st.markdown("Featuring **ultra-fast vector store creation**, **advanced multi-strategy RAG search**, **context-aware conversations**, and optimized processing for all your requests.")
 
     # Initialize chatbot
     kernel, chat_service, openai_client = initialize_chatbot()
     
     if kernel is None:
         st.stop()
+    
+    # Show debug panel (outside cached function)
+    endpoint = os.getenv("ENDPOINT_URL")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    model_name = os.getenv("DEPLOYMENT_NAME")
+    api_version = os.getenv("API_VERSION")
+    
+    # Extract the base endpoint (remove the full path)
+    if endpoint and "/openai/deployments/" in endpoint:
+        base_endpoint = endpoint.split("/openai/deployments/")[0]
+    else:
+        base_endpoint = endpoint
+    
+    show_debug_panel(openai_client, model_name, base_endpoint, api_version, api_key)
 
     # Add optimized vector store UI to sidebar
-    vector_manager = create_optimized_vector_store_ui(openai_client, os.getenv("DEPLOYMENT_NAME"))
+    vector_manager = create_optimized_vector_store_ui(openai_client, model_name)
+    
+    # Store openai_client in session state for knowledge base agent
+    st.session_state.openai_client = openai_client
 
     # Initialize session state for chat history and agent states
     if "messages" not in st.session_state:
@@ -744,6 +1177,9 @@ def main():
         st.session_state.agent_active = False
         st.session_state.agent_complete = False
         st.session_state.agent_result = ""
+        st.session_state.kb_query_processed = False
+        st.session_state.original_user_query = ""
+        st.session_state.last_successful_category = None
 
     # Display chat messages
     chat_container = st.container()
@@ -759,14 +1195,17 @@ def main():
         st.markdown("---")
         
         if handle_agent_conversation(st.session_state.pending_category):
-            # Agent completed
+            # Agent completed - store successful category for context
             st.session_state.messages.append({"role": "assistant", "content": st.session_state.agent_result})
+            st.session_state.last_successful_category = st.session_state.pending_category
             st.session_state.agent_active = False
             st.session_state.waiting_for_confirmation = False
             st.session_state.pending_category = None
             st.session_state.pending_function = None
             st.session_state.agent_complete = False
             st.session_state.agent_result = ""
+            st.session_state.kb_query_processed = False
+            st.session_state.original_user_query = ""
             st.rerun()
         
         # Add back to main button
@@ -775,6 +1214,9 @@ def main():
             st.session_state.waiting_for_confirmation = False
             st.session_state.pending_category = None
             st.session_state.pending_function = None
+            st.session_state.kb_query_processed = False
+            st.session_state.original_user_query = ""
+            # Keep last_successful_category to maintain context for next question
             st.rerun()
             
     elif st.session_state.waiting_for_confirmation:
@@ -799,6 +1241,9 @@ def main():
                 st.session_state.waiting_for_confirmation = False
                 st.session_state.pending_category = None
                 st.session_state.pending_function = None
+                st.session_state.kb_query_processed = False
+                st.session_state.original_user_query = ""
+                # Don't reset last_successful_category here to maintain context
                 
                 st.rerun()
     
@@ -810,8 +1255,6 @@ def main():
             
             # Show analyzing message
             with st.spinner("🔍 Analyzing your request..."):
-                # Get model name from environment
-                model_name = os.getenv("DEPLOYMENT_NAME")
                 # Categorize using direct OpenAI client
                 category = categorize_with_direct_openai(openai_client, prompt, model_name)
             
@@ -820,11 +1263,17 @@ def main():
                 "Report Sick": ("report_sick", "report that you're not feeling well"),
                 "Report Fatigue": ("report_fatigue", "report fatigue or tiredness"), 
                 "Book Hotel": ("book_hotel", "book a hotel"),
-                "Book Limo": ("book_limo", "book a limo/transportation")
+                "Book Limo": ("book_limo", "book a limo/transportation"),
+                "Search Knowledge Base": ("search_knowledge_base", "search documents and knowledge base")
             }
             
             if category in valid_categories:
                 function_name, description = valid_categories[category]
+                
+                # Store original query for Knowledge Base agent
+                if category == "Search Knowledge Base":
+                    st.session_state.original_user_query = prompt
+                    st.session_state.kb_query_processed = False
                 
                 # Show identified category
                 category_message = f"🎯 I've identified your request as: **{category}**\n\nWould you like me to connect you with our Specialized Agent?"
@@ -844,7 +1293,7 @@ def main():
 
     # Enhanced sidebar with performance info
     with st.sidebar:
-        st.header("🚀 Performance Optimized Services")
+        st.header("🚀 Enhanced Multi-Agent Services")
         st.markdown("""
         **I can help you with:**
         
@@ -863,26 +1312,73 @@ def main():
         🚗 **Book Limo**
         - Transportation, rides, car services
         - *No additional info required*
+        
+        📚 **Enhanced RAG Search**
+        - Multi-strategy document search (vector + keyword + expansion)
+        - Context-aware follow-up questions
+        - Ask questions about uploaded PDFs with improved accuracy
+        - Get AI-powered summaries with better context
+        - Works even with difficult queries
+        - *Requires: Vector store with PDFs*
         """)
         
         st.header("💡 Example Requests")
         st.markdown("""
+        **Service Requests:**
         - "I have a headache"
         - "Need somewhere to stay tonight"
         - "Feeling really drained"
         - "Can you get me a ride?"
+        
+        **Enhanced RAG Queries:**
+        - "How many years of experience does [person] have?"
+        - "What skills are mentioned in the resume?"
+        - "Find information about XYZ"
+        - "What are the technical skills listed?"
+        - "Summarize the main qualifications"
+        - "What does the document say about education?"
+        
+        **📋 Context-Aware Follow-ups:**
+        - After asking about someone: "Which company does he work for?"
+        - "What about his education background?"
+        - "Does he have any certifications?"
+        - "Where is he located?"
         """)
         
-        st.header("⚡ Performance Features")
+        # Show context status
+        if st.session_state.get('last_successful_category') == "Search Knowledge Base":
+            st.info("🔗 **Context Active**: Follow-up questions will automatically use the Knowledge Base")
+        
+        st.header("⚡ Advanced RAG Features")
         st.markdown("""
+        - **Context-aware conversations**: Follow-up questions automatically use Knowledge Base
+        - **Multi-strategy search**: Vector + keyword + query expansion
+        - **Enhanced chunking**: Better overlap and sizing for RAG
+        - **Intelligent prompting**: Optimized for factual extraction
+        - **Lenient matching**: Finds relevant content even with low similarity
+        - **Query expansion**: Automatically tries related terms
+        - **Fallback search**: Keyword matching when vector search fails
         - **Ultra-fast** vector store creation
         - **Batch processing** for embeddings
         - **GPU acceleration** when available
-        - **Optimized chunking** and indexing
         - **Smart memory management**
         - **Process up to 10 PDF files**
         - **Files up to 10MB supported**
         """)
+        
+        # Show knowledge base status
+        if VECTOR_STORE_AVAILABLE and "vector_manager" in st.session_state:
+            vector_manager = st.session_state.vector_manager
+            index, metadata = vector_manager.load_vector_store()
+            if index is not None and metadata is not None:
+                sources = set(item["source"] for item in metadata)
+                st.success(f"📚 Enhanced RAG Ready: {len(sources)} documents, {len(metadata)} chunks")
+                
+                # Show context status in sidebar too
+                if st.session_state.get('last_successful_category') == "Search Knowledge Base":
+                    st.info("🔗 Context Active: Next questions will use Knowledge Base")
+            else:
+                st.info("📚 Knowledge Base: Not created yet")
         
         st.markdown("---")
         st.header("🔧 Installation & Setup")
@@ -897,17 +1393,39 @@ def main():
         pip install faiss-gpu PyPDF2
         ```
         
+        **Environment Variables Required:**
+        ```bash
+        ENDPOINT_URL=https://your-resource.openai.azure.com
+        AZURE_OPENAI_API_KEY=your-api-key
+        DEPLOYMENT_NAME=your-model-deployment-name
+        API_VERSION=2024-12-01-preview
+        ```
+        
+        **Troubleshooting 404 Errors:**
+        - ✅ Verify DEPLOYMENT_NAME matches your Azure model deployment
+        - ✅ Check ENDPOINT_URL format (no trailing slash)
+        - ✅ Ensure deployment is active in Azure Portal
+        - ✅ Test connection using the debug panel above
+        
         **Performance Tips:**
         - Use PDF files under 10MB for best performance
-        - Process up to 10 files at once
+        - Process up to 10 files at once  
+        - Enhanced RAG uses multi-strategy search for better results
         - GPU acceleration used automatically when available
         - Optimized batch processing for fast embedding generation
+        - Better chunking strategy improves answer quality
         """)
         
         # Show current performance status
         if VECTOR_STORE_AVAILABLE:
             gpu_status = "🚀 GPU Accelerated" if GPU_AVAILABLE else "💻 CPU Optimized"
             st.markdown(f"**Status:** {gpu_status}")
+            
+        # Show AI summary status
+        if "openai_client" in st.session_state:
+            st.markdown("**Enhanced RAG:** ⚡ Multi-strategy search available")
+        else:
+            st.markdown("**Enhanced RAG:** ❌ Configuration issue")
         
         if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []
@@ -917,6 +1435,9 @@ def main():
             st.session_state.agent_active = False
             st.session_state.agent_complete = False
             st.session_state.agent_result = ""
+            st.session_state.kb_query_processed = False
+            st.session_state.original_user_query = ""
+            st.session_state.last_successful_category = None
             st.rerun()
 
 if __name__ == "__main__":
