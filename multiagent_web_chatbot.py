@@ -27,16 +27,26 @@ try:
     except:
         GPU_AVAILABLE = False
         
+    # Try to import advanced RAG dependencies
+    try:
+        from rank_bm25 import BM25Okapi
+        import re
+        from collections import Counter
+        BM25_AVAILABLE = True
+    except ImportError:
+        BM25_AVAILABLE = False
+        
 except ImportError:
     VECTOR_STORE_AVAILABLE = False
     GPU_AVAILABLE = False
+    BM25_AVAILABLE = False
 
-class OptimizedVectorStoreManager:
-    """Highly optimized FAISS vector store manager with performance improvements."""
+class HybridRAGManager:
+    """Advanced Hybrid RAG with Intelligent Pre-processing and Context Compression."""
     
     def __init__(self, openai_client, model_name, data_folder="data", vector_store_path="vector_store"):
         if not VECTOR_STORE_AVAILABLE:
-            raise ImportError("Vector store dependencies not available. Install with: pip install faiss-cpu PyPDF2")
+            raise ImportError("Vector store dependencies not available. Install with: pip install faiss-cpu PyPDF2 rank-bm25")
         
         self.openai_client = openai_client
         self.model_name = model_name
@@ -45,356 +55,360 @@ class OptimizedVectorStoreManager:
         self.vector_store_path.mkdir(exist_ok=True)
         self.data_folder.mkdir(exist_ok=True)
         
-        # Optimized settings
+        # Advanced settings
         self.use_gpu = GPU_AVAILABLE
+        self.use_bm25 = BM25_AVAILABLE
         self.embedding_model = "text-embedding-ada-002"
+        self.chunk_size = 1000
+        self.chunk_overlap = 200
+        self.max_chunks_per_file = 50
         
         if self.use_gpu:
             st.info(f"🚀 GPU acceleration enabled! Found {faiss.get_num_gpus()} GPU(s)")
+        
+        if self.use_bm25:
+            st.info("🔍 Hybrid retrieval available (Vector + BM25)")
         else:
-            st.info("💻 Using CPU for vector operations")
+            st.warning("⚠️ BM25 not available. Install: pip install rank-bm25")
     
-    def extract_text_from_pdf(self, pdf_path: Path) -> str:
-        """Optimized PDF text extraction."""
-        try:
-            with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                
-                # Process more pages but efficiently
-                max_pages = min(100, len(pdf_reader.pages))  # Increased from 50
-                text_parts = []
-                
-                for page in pdf_reader.pages[:max_pages]:
-                    try:
-                        text = page.extract_text()
-                        if text and text.strip():
-                            text_parts.append(text.strip())
-                    except:
-                        continue
-                
-                full_text = "\n".join(text_parts)
-                
-                if len(pdf_reader.pages) > max_pages:
-                    st.info(f"Processed {max_pages} of {len(pdf_reader.pages)} pages")
-                
-                return full_text
-                
-        except Exception as e:
-            st.error(f"Error reading PDF {pdf_path.name}: {str(e)}")
-            return ""
-    
-    def chunk_text(self, text: str, chunk_size: int = 1200, overlap: int = 300) -> List[str]:
-        """Optimized text chunking with better parameters for RAG."""
+    def intelligent_text_preprocessing(self, text: str) -> Dict:
+        """Advanced text preprocessing with structure awareness."""
         if not text.strip():
-            return []
+            return {"sections": [], "metadata": {}}
         
-        # More reasonable limits
-        max_total_length = 100000
-        if len(text) > max_total_length:
-            text = text[:max_total_length]
-            st.info(f"Text truncated to {max_total_length} characters")
+        # Clean and normalize text
+        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Limit consecutive newlines
         
-        chunks = []
-        start = 0
-        text_len = len(text)
+        # Extract structure markers
+        sections = []
+        current_section = {"title": "", "content": "", "type": "content"}
         
-        while start < text_len:
-            end = min(start + chunk_size, text_len)
-            
-            # Find a good break point (sentence or paragraph end)
-            if end < text_len:
-                for break_char in ['\n\n', '. ', '! ', '? ', '\n']:
-                    break_pos = text.rfind(break_char, start + chunk_size//2, end)
-                    if break_pos > start:
-                        end = break_pos + len(break_char)
-                        break
-            
-            chunk = text[start:end].strip()
-            if chunk and len(chunk) > 50:  # Lower minimum chunk size
-                chunks.append(chunk)
-            
-            if end >= text_len:
-                break
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
                 
-            start = end - overlap
+            # Detect headers/sections
+            if (len(line) < 100 and 
+                (line.isupper() or 
+                 re.match(r'^[A-Z][a-z\s]+:?\s*$', line) or
+                 re.match(r'^\d+\.\s+[A-Z]', line) or
+                 line.endswith(':'))):
+                
+                # Save previous section
+                if current_section["content"]:
+                    sections.append(current_section.copy())
+                
+                # Start new section
+                current_section = {
+                    "title": line,
+                    "content": "",
+                    "type": "header" if line.isupper() else "section"
+                }
+            else:
+                current_section["content"] += " " + line
         
-        # More reasonable chunk limit
-        max_chunks = 150  # Increased for better coverage
-        if len(chunks) > max_chunks:
-            st.warning(f"Using first {max_chunks} chunks out of {len(chunks)}")
-            chunks = chunks[:max_chunks]
+        # Add final section
+        if current_section["content"]:
+            sections.append(current_section)
+        
+        # Extract metadata
+        metadata = self._extract_metadata(text)
+        
+        return {"sections": sections, "metadata": metadata}
+    
+    def _extract_metadata(self, text: str) -> Dict:
+        """Extract key metadata from text."""
+        metadata = {}
+        
+        # Extract emails
+        emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+        if emails:
+            metadata["emails"] = emails
+        
+        # Extract phone numbers
+        phones = re.findall(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', text)
+        if phones:
+            metadata["phones"] = phones
+        
+        # Extract years of experience
+        experience = re.findall(r'(\d+)\s+years?\s+of\s+experience', text, re.IGNORECASE)
+        if experience:
+            metadata["experience_years"] = experience
+        
+        # Extract education keywords
+        education_keywords = ['university', 'college', 'degree', 'bachelor', 'master', 'phd', 'diploma']
+        found_education = [word for word in education_keywords if word in text.lower()]
+        if found_education:
+            metadata["education_terms"] = found_education
+        
+        # Extract technology keywords
+        tech_keywords = ['python', 'java', 'javascript', 'react', 'node', 'sql', 'aws', 'azure', 'docker', 'kubernetes']
+        found_tech = [word for word in tech_keywords if word.lower() in text.lower()]
+        if found_tech:
+            metadata["technologies"] = found_tech
+        
+        return metadata
+    
+    def intelligent_chunking(self, sections: List[Dict], chunk_size: int = 1000, overlap: int = 200) -> List[Dict]:
+        """Intelligent chunking with context preservation."""
+        chunks = []
+        
+        for section in sections:
+            title = section.get("title", "")
+            content = section.get("content", "")
+            section_type = section.get("type", "content")
+            
+            if not content.strip():
+                continue
+            
+            # For small sections, keep whole
+            if len(content) <= chunk_size:
+                chunks.append({
+                    "content": f"{title}\n{content}".strip(),
+                    "title": title,
+                    "type": section_type,
+                    "tokens": self._estimate_tokens(content)
+                })
+                continue
+            
+            # Split large sections intelligently
+            sentences = re.split(r'(?<=[.!?])\s+', content)
+            current_chunk = title + "\n" if title else ""
+            current_size = len(current_chunk)
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                
+                # Check if adding sentence exceeds chunk size
+                if current_size + len(sentence) > chunk_size and current_chunk.strip():
+                    # Save current chunk
+                    chunks.append({
+                        "content": current_chunk.strip(),
+                        "title": title,
+                        "type": section_type,
+                        "tokens": self._estimate_tokens(current_chunk)
+                    })
+                    
+                    # Start new chunk with overlap
+                    overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                    current_chunk = f"{title}\n{overlap_text}" if title else overlap_text
+                    current_size = len(current_chunk)
+                
+                current_chunk += " " + sentence
+                current_size += len(sentence) + 1
+            
+            # Add final chunk
+            if current_chunk.strip():
+                chunks.append({
+                    "content": current_chunk.strip(),
+                    "title": title,
+                    "type": section_type,
+                    "tokens": self._estimate_tokens(current_chunk)
+                })
         
         return chunks
     
-    def get_embeddings_batch_optimized(self, texts: List[str], batch_size: int = 50) -> np.ndarray:
-        """Highly optimized batch embedding generation."""
-        if not texts:
-            return np.array([])
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimation."""
+        return len(text.split()) * 1.3  # Approximate
+    
+    def create_hybrid_search_index(self, chunks: List[Dict]) -> Dict:
+        """Create both vector and BM25 indices."""
+        if not chunks:
+            return {"vector_index": None, "bm25_index": None, "metadata": []}
         
+        # Prepare texts and metadata
+        texts = [chunk["content"] for chunk in chunks]
+        metadata = [
+            {
+                "content": chunk["content"],  # Store full content now
+                "title": chunk.get("title", ""),
+                "type": chunk.get("type", "content"),
+                "tokens": chunk.get("tokens", 0),
+                "chunk_id": i
+            }
+            for i, chunk in enumerate(chunks)
+        ]
+        
+        # Create vector index
+        st.info("🔄 Creating vector embeddings...")
+        embeddings = self.get_embeddings_optimized(texts)
+        vector_index = self.create_faiss_index(embeddings)
+        
+        # Create BM25 index
+        bm25_index = None
+        tokenized_docs = None
+        if self.use_bm25:
+            st.info("🔄 Creating BM25 sparse index...")
+            tokenized_docs = [self._tokenize_for_bm25(text) for text in texts]
+            bm25_index = BM25Okapi(tokenized_docs)
+        
+        return {
+            "vector_index": vector_index,
+            "bm25_index": bm25_index,
+            "metadata": metadata,
+            "tokenized_docs": tokenized_docs if self.use_bm25 else None
+        }
+    
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        """Tokenize text for BM25."""
+        # Simple tokenization
+        text = re.sub(r'[^\w\s]', ' ', text.lower())
+        return text.split()
+    
+    def _advanced_tokenize_for_bm25(self, text: str) -> List[str]:
+        """Advanced tokenization for better BM25 matching."""
+        # Simple tokenization with basic preprocessing
+        text = re.sub(r'[^\w\s]', ' ', text.lower())
+        return [token for token in text.split() if len(token) > 1]
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences."""
+        return re.split(r'(?<=[.!?])\s+', text)
+    
+    def get_embeddings_optimized(self, texts: List[str], batch_size: int = 40) -> np.ndarray:
+        """Optimized embedding generation."""
         embeddings = []
-        total_batches = (len(texts) + batch_size - 1) // batch_size
-        
-        # Create a single progress bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        start_time = time.time()
         
         for i in range(0, len(texts), batch_size):
-            batch_num = i // batch_size + 1
             batch = texts[i:i + batch_size]
             
-            # Update status less frequently
-            status_text.text(f"🔄 Processing batch {batch_num}/{total_batches} ({len(batch)} texts)")
-            
             try:
-                # Prepare batch with length limits
-                processed_batch = []
-                for text in batch:
-                    # More generous token limit
-                    if len(text) > 8000:
-                        text = text[:8000]
-                    processed_batch.append(text)
+                # Process batch
+                batch_texts = [text[:8000] for text in batch]  # Truncate
                 
-                # Single API call for entire batch
                 response = self.openai_client.embeddings.create(
                     model=self.embedding_model,
-                    input=processed_batch
+                    input=batch_texts
                 )
                 
-                # Extract embeddings
                 batch_embeddings = [item.embedding for item in response.data]
                 embeddings.extend(batch_embeddings)
                 
-                # Update progress
-                progress = min((i + batch_size) / len(texts), 1.0)
-                progress_bar.progress(progress)
+                # Progress
+                progress = min(i + batch_size, len(texts))
+                if progress % 20 == 0:
+                    st.write(f"✅ Processed {progress}/{len(texts)} embeddings")
                 
             except Exception as e:
-                st.warning(f"Error in batch {batch_num}: {str(e)}")
+                st.warning(f"Error in batch {i//batch_size + 1}: {str(e)}")
                 # Add zero vectors for failed batch
                 for _ in batch:
                     embeddings.append([0.0] * 1536)
         
-        # Show completion stats
-        elapsed_time = time.time() - start_time
-        status_text.text(f"✅ Generated {len(embeddings)} embeddings in {elapsed_time:.1f}s")
-        progress_bar.progress(1.0)
-        
         return np.array(embeddings, dtype=np.float32)
     
-    def create_optimized_index(self, embeddings: np.ndarray):
+    def create_faiss_index(self, embeddings: np.ndarray):
         """Create optimized FAISS index."""
+        if embeddings.size == 0:
+            return None
+        
         dimension = embeddings.shape[1]
         n_vectors = embeddings.shape[0]
         
-        # Choose index type based on data size
+        # Choose index type
         if n_vectors < 1000:
-            # Use simple flat index for small datasets
             index = faiss.IndexFlatL2(dimension)
         else:
-            # Use IVF index for larger datasets
             nlist = min(100, n_vectors // 10)
             quantizer = faiss.IndexFlatL2(dimension)
             index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
-            
-            # Train the index
             index.train(embeddings)
         
-        # Add vectors to index
-        if self.use_gpu and n_vectors > 500:  # Use GPU for larger datasets
+        # GPU acceleration
+        if self.use_gpu and n_vectors > 500:
             try:
                 res = faiss.StandardGpuResources()
                 gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
                 gpu_index.add(embeddings)
-                # Convert back to CPU for saving
                 index = faiss.index_gpu_to_cpu(gpu_index)
-                st.success("🚀 Used GPU acceleration for indexing!")
-            except Exception as e:
-                st.warning(f"GPU indexing failed: {str(e)}, using CPU")
+                st.success("🚀 Used GPU acceleration!")
+            except:
                 index.add(embeddings)
         else:
             index.add(embeddings)
         
         return index
     
-    def create_vector_store(self) -> Dict:
-        """Optimized vector store creation with performance improvements."""
-        pdf_files = list(self.data_folder.glob("*.pdf"))
+    def hybrid_search(self, query: str, k: int = 10) -> List[Dict]:
+        """Enhanced hybrid search with query preprocessing."""
+        indices = self.load_hybrid_indices()
+        if not indices or not indices["metadata"]:
+            return []
         
-        if not pdf_files:
-            return {"success": False, "message": "No PDF files found in data folder"}
+        vector_index = indices["vector_index"]
+        bm25_index = indices["bm25_index"]
+        metadata = indices["metadata"]
         
-        # Process more files but with better memory management
-        max_files = 10  # Increased from 1
-        if len(pdf_files) > max_files:
-            st.warning(f"Processing first {max_files} of {len(pdf_files)} files for optimal performance")
-            pdf_files = pdf_files[:max_files]
+        # Preprocess query for better matching
+        processed_query = self._preprocess_query(query)
         
-        all_texts = []
-        all_metadata = []
+        all_results = []
         
-        # Main progress tracking
-        main_progress = st.progress(0)
-        main_status = st.empty()
-        
-        start_time = time.time()
-        
-        # Phase 1: Extract and chunk text (30% of progress)
-        main_status.text("📄 Extracting and chunking text from PDFs...")
-        
-        for file_idx, pdf_file in enumerate(pdf_files):
-            # Check reasonable file size limit
-            file_size = pdf_file.stat().st_size
-            if file_size > 10 * 1024 * 1024:  # 10MB limit (increased from 1MB)
-                st.warning(f"Large file {pdf_file.name} ({file_size//1024//1024}MB) - processing first 100 pages")
+        # Vector search with query variations
+        if vector_index:
+            # Original query
+            vector_results = self._vector_search_internal(query, vector_index, metadata, k)
+            for result in vector_results:
+                result["search_type"] = "vector"
+                result["query_variant"] = "original"
+            all_results.extend(vector_results)
             
-            # Extract text
-            text = self.extract_text_from_pdf(pdf_file)
-            if not text:
-                continue
-            
-            # Chunk text with optimized parameters
-            chunks = self.chunk_text(text)
-            
-            # Add chunks and metadata
-            for i, chunk in enumerate(chunks):
-                all_texts.append(chunk)
-                all_metadata.append({
-                    "source": pdf_file.name,
-                    "chunk_id": i,
-                    "content": chunk[:300]  # Store more content in metadata
-                })
-            
-            # Update progress
-            file_progress = (file_idx + 1) / len(pdf_files) * 0.3
-            main_progress.progress(file_progress)
+            # Processed query if different
+            if processed_query != query:
+                processed_results = self._vector_search_internal(processed_query, vector_index, metadata, k//2)
+                for result in processed_results:
+                    result["search_type"] = "vector"
+                    result["query_variant"] = "processed"
+                all_results.extend(processed_results)
         
-        if not all_texts:
-            return {"success": False, "message": "No text extracted from PDF files"}
+        # BM25 search
+        if bm25_index and self.use_bm25:
+            bm25_results = self._bm25_search(processed_query, bm25_index, metadata, k)
+            for result in bm25_results:
+                result["search_type"] = "bm25"
+            all_results.extend(bm25_results)
         
-        main_status.text(f"📊 Processing {len(all_texts)} text chunks...")
+        # Enhanced reciprocal rank fusion
+        combined_results = self._enhanced_reciprocal_rank_fusion(all_results, k)
         
-        # Phase 2: Generate embeddings (60% of progress)
-        main_progress.progress(0.3)
+        return combined_results[:k]
+    
+    def _preprocess_query(self, query: str) -> str:
+        """Preprocess query for better search performance."""
+        # Convert to lowercase for better matching
+        processed = query.lower()
         
-        try:
-            embeddings = self.get_embeddings_batch_optimized(all_texts)
-            main_progress.progress(0.9)
-        except Exception as e:
-            return {"success": False, "message": f"Error generating embeddings: {str(e)}"}
-        
-        # Phase 3: Create index (10% of progress)
-        main_status.text("🔧 Creating optimized search index...")
-        
-        try:
-            index = self.create_optimized_index(embeddings)
-            main_progress.progress(0.95)
-        except Exception as e:
-            return {"success": False, "message": f"Error creating index: {str(e)}"}
-        
-        # Phase 4: Save everything
-        main_status.text("💾 Saving vector store...")
-        
-        try:
-            index_path = self.vector_store_path / "faiss_index.bin"
-            metadata_path = self.vector_store_path / "metadata.pkl"
-            
-            faiss.write_index(index, str(index_path))
-            
-            with open(metadata_path, 'wb') as f:
-                pickle.dump(all_metadata, f)
-                
-        except Exception as e:
-            return {"success": False, "message": f"Error saving: {str(e)}"}
-        
-        # Complete
-        total_time = time.time() - start_time
-        main_progress.progress(1.0)
-        main_status.text(f"✅ Vector store created in {total_time:.1f}s!")
-        
-        return {
-            "success": True, 
-            "message": f"Vector store created with {len(all_texts)} chunks from {len(pdf_files)} files in {total_time:.1f}s",
-            "chunks": len(all_texts),
-            "files": len(pdf_files),
-            "time": total_time
+        # Expand common abbreviations
+        abbreviations = {
+            'yrs': 'years',
+            'exp': 'experience',
+            'tech': 'technology',
+            'dev': 'development',
+            'mgmt': 'management',
+            'eng': 'engineering',
+            'comp': 'computer',
+            'sci': 'science',
+            'univ': 'university'
         }
+        
+        for abbr, full in abbreviations.items():
+            processed = re.sub(r'\b' + abbr + r'\b', full, processed)
+        
+        # Add context for experience queries
+        if 'experience' in processed and 'years' not in processed:
+            processed += ' years'
+        
+        return processed
     
-    def load_vector_store(self) -> tuple:
-        """Load existing vector store."""
-        index_path = self.vector_store_path / "faiss_index.bin"
-        metadata_path = self.vector_store_path / "metadata.pkl"
-        
-        if not (index_path.exists() and metadata_path.exists()):
-            return None, None
-        
+    def _vector_search_internal(self, query: str, index, metadata: List[Dict], k: int) -> List[Dict]:
+        """Enhanced vector search with better scoring."""
         try:
-            index = faiss.read_index(str(index_path))
-            with open(metadata_path, 'rb') as f:
-                metadata = pickle.load(f)
-            return index, metadata
-        except Exception as e:
-            st.error(f"Error loading vector store: {str(e)}")
-            return None, None
-    
-    def enhanced_search_similar(self, query: str, k: int = 5) -> List[Dict]:
-        """Enhanced similarity search with multiple strategies for better RAG quality."""
-        index, metadata = self.load_vector_store()
-        
-        if index is None or metadata is None:
-            return []
-        
-        try:
-            # Strategy 1: Direct vector search with original query
-            results = self._vector_search(query, k * 2)  # Get more results initially
-            
-            # Strategy 2: Query expansion for better matching
-            expanded_queries = self._expand_query(query)
-            for expanded_query in expanded_queries:
-                expanded_results = self._vector_search(expanded_query, k)
-                results.extend(expanded_results)
-            
-            # Strategy 3: Keyword-based fallback search
-            keyword_results = self._keyword_search(query, metadata, k)
-            results.extend(keyword_results)
-            
-            # Remove duplicates and sort by relevance
-            seen_indices = set()
-            unique_results = []
-            for result in results:
-                idx = result.get('chunk_id', -1)
-                source = result.get('source', '')
-                key = f"{source}_{idx}"
-                if key not in seen_indices:
-                    seen_indices.add(key)
-                    unique_results.append(result)
-            
-            # Sort by similarity score (lower is better for L2 distance)
-            unique_results.sort(key=lambda x: x.get('similarity_score', float('inf')))
-            
-            # Return top k results with more lenient threshold
-            return unique_results[:k]
-            
-        except Exception as e:
-            error_msg = str(e)
-            if "404" in error_msg or "DeploymentNotFound" in error_msg:
-                st.error("❌ Embedding service unavailable - check your Azure OpenAI deployment configuration")
-            elif "401" in error_msg:
-                st.error("❌ Authentication failed - check your API key and endpoint")
-            else:
-                st.error(f"❌ Search error: {error_msg}")
-            return []
-    
-    def _vector_search(self, query: str, k: int) -> List[Dict]:
-        """Perform vector similarity search."""
-        index, metadata = self.load_vector_store()
-        
-        if index is None or metadata is None:
-            return []
-        
-        try:
-            # Get query embedding
             response = self.openai_client.embeddings.create(
                 model=self.embedding_model,
                 input=[query[:8000]]
@@ -402,7 +416,7 @@ class OptimizedVectorStoreManager:
             
             query_embedding = np.array([response.data[0].embedding], dtype=np.float32)
             
-            # Search with larger k to get more candidates
+            # Search with more candidates for better selection
             search_k = min(k * 3, index.ntotal)
             distances, indices = index.search(query_embedding, search_k)
             
@@ -410,90 +424,401 @@ class OptimizedVectorStoreManager:
             for i, idx in enumerate(indices[0]):
                 if idx < len(metadata) and idx >= 0:
                     result = metadata[idx].copy()
-                    result["similarity_score"] = float(distances[0][i])
+                    # Convert L2 distance to similarity score (0-1, higher is better)
+                    similarity = 1.0 / (1.0 + distances[0][i])
+                    result["similarity_score"] = float(distances[0][i])  # Keep original for compatibility
+                    result["normalized_score"] = similarity
                     results.append(result)
             
             return results
             
-        except Exception:
+        except Exception as e:
+            st.error(f"Vector search error: {str(e)}")
             return []
     
-    def _expand_query(self, query: str) -> List[str]:
-        """Expand query with synonyms and variations for better matching."""
-        expanded = []
-        
-        # Common expansions for CV/resume queries
-        experience_terms = ["experience", "years", "work", "career", "professional", "background"]
-        skill_terms = ["skills", "technologies", "expertise", "proficient", "knowledge"]
-        education_terms = ["education", "degree", "university", "college", "study"]
-        
-        query_lower = query.lower()
-        
-        # Expand experience-related queries
-        if any(term in query_lower for term in ["experience", "years"]):
-            expanded.extend([
-                "professional experience years",
-                "work experience career",
-                "years of experience",
-                "professional background"
-            ])
-        
-        # Expand skill-related queries  
-        if any(term in query_lower for term in ["skill", "technology", "tech"]):
-            expanded.extend([
-                "technical skills technologies",
-                "expertise proficient",
-                "programming languages tools"
-            ])
-        
-        # Expand education queries
-        if any(term in query_lower for term in ["education", "degree", "study"]):
-            expanded.extend([
-                "education degree university",
-                "academic background",
-                "qualifications studies"
-            ])
-        
-        # Add simplified versions
-        words = query.split()
-        if len(words) > 2:
-            # Try with just the key terms
-            key_words = [w for w in words if len(w) > 3 and w.lower() not in ["what", "how", "many", "does", "have", "the", "is"]]
-            if key_words:
-                expanded.append(" ".join(key_words))
-        
-        return expanded[:3]  # Limit to 3 expansions
-    
-    def _keyword_search(self, query: str, metadata: List[Dict], k: int) -> List[Dict]:
-        """Fallback keyword-based search for when vector search fails."""
-        query_words = query.lower().split()
-        query_words = [w for w in query_words if len(w) > 2]  # Filter short words
-        
-        scored_results = []
-        
-        for i, item in enumerate(metadata):
-            content = item.get('content', '').lower()
+    def _bm25_search(self, query: str, bm25_index, metadata: List[Dict], k: int) -> List[Dict]:
+        """Enhanced BM25 search with better scoring."""
+        try:
+            query_tokens = self._advanced_tokenize_for_bm25(query)
             
-            # Simple keyword matching score
-            score = 0
-            for word in query_words:
-                if word in content:
-                    score += content.count(word)
+            if not query_tokens:
+                return []
             
-            if score > 0:
-                result = item.copy()
-                result['similarity_score'] = 1.0 / (score + 1)  # Convert to similarity format (lower is better)
-                result['search_type'] = 'keyword'
-                scored_results.append(result)
-        
-        # Sort by score (lower similarity_score is better)
-        scored_results.sort(key=lambda x: x['similarity_score'])
-        
-        return scored_results[:k]
+            scores = bm25_index.get_scores(query_tokens)
+            
+            # Get top k indices with non-zero scores
+            scored_indices = [(i, score) for i, score in enumerate(scores) if score > 0]
+            scored_indices.sort(key=lambda x: x[1], reverse=True)
+            
+            results = []
+            for idx, score in scored_indices[:k * 2]:  # Get more candidates
+                if idx < len(metadata):
+                    result = metadata[idx].copy()
+                    # Normalize BM25 score to similarity format
+                    normalized_score = min(score / 10.0, 1.0)  # Adjust scaling as needed
+                    result["similarity_score"] = float(1.0 - normalized_score)  # For compatibility
+                    result["bm25_score"] = float(score)
+                    result["normalized_score"] = normalized_score
+                    results.append(result)
+            
+            return results
+            
+        except Exception as e:
+            st.error(f"BM25 search error: {str(e)}")
+            return []
     
-    def search_similar(self, query: str, k: int = 5) -> List[Dict]:
-        """Main search function - use enhanced search."""
-        return self.enhanced_search_similar(query, k)
+    def _enhanced_reciprocal_rank_fusion(self, results: List[Dict], k: int) -> List[Dict]:
+        """Enhanced RRF with query variant and search type weighting."""
+        rrf_scores = {}
+        
+        # Group results by search type and query variant
+        vector_results = [r for r in results if r.get("search_type") == "vector"]
+        bm25_results = [r for r in results if r.get("search_type") == "bm25"]
+        
+        # Sort each group by their respective scores
+        vector_results.sort(key=lambda x: x.get("similarity_score", float('inf')))
+        bm25_results.sort(key=lambda x: x.get("similarity_score", float('inf')))
+        
+        # RRF parameters
+        rank_constant = 60
+        vector_weight = 0.7  # Slightly favor vector search
+        bm25_weight = 0.3
+        
+        # Calculate RRF scores for vector results
+        for rank, result in enumerate(vector_results):
+            chunk_id = result["chunk_id"]
+            if chunk_id not in rrf_scores:
+                rrf_scores[chunk_id] = {"result": result, "score": 0, "vector_rank": None, "bm25_rank": None}
+            
+            score_contribution = vector_weight / (rank_constant + rank + 1)
+            rrf_scores[chunk_id]["score"] += score_contribution
+            rrf_scores[chunk_id]["vector_rank"] = rank + 1
+        
+        # Calculate RRF scores for BM25 results
+        for rank, result in enumerate(bm25_results):
+            chunk_id = result["chunk_id"]
+            if chunk_id not in rrf_scores:
+                rrf_scores[chunk_id] = {"result": result, "score": 0, "vector_rank": None, "bm25_rank": None}
+            
+            score_contribution = bm25_weight / (rank_constant + rank + 1)
+            rrf_scores[chunk_id]["score"] += score_contribution
+            rrf_scores[chunk_id]["bm25_rank"] = rank + 1
+        
+        # Sort by RRF score and prepare final results
+        sorted_results = sorted(rrf_scores.items(), key=lambda x: x[1]["score"], reverse=True)
+        
+        final_results = []
+        for chunk_id, data in sorted_results:
+            result = data["result"].copy()
+            result["rrf_score"] = data["score"]
+            result["vector_rank"] = data["vector_rank"]
+            result["bm25_rank"] = data["bm25_rank"]
+            result["similarity_score"] = 1.0 - data["score"]  # Convert for compatibility
+            final_results.append(result)
+        
+        return final_results
+    
+    def context_compression(self, results: List[Dict], query: str, max_tokens: int = 4000) -> str:
+        """Advanced context compression with query-aware selection."""
+        if not results:
+            return ""
+        
+        # Sort by RRF score if available, otherwise by similarity
+        results = sorted(results, 
+                        key=lambda x: x.get("rrf_score", 1.0 - x.get("similarity_score", 1.0)), 
+                        reverse=True)
+        
+        compressed_sections = []
+        total_tokens = 0
+        seen_content_hashes = set()
+        query_keywords = set(self._advanced_tokenize_for_bm25(query.lower()))
+        
+        for result in results:
+            content = result.get("content", "")
+            title = result.get("title", "")
+            
+            # Skip very similar content using content hashing
+            content_hash = hash(content[:300])
+            if content_hash in seen_content_hashes:
+                continue
+            seen_content_hashes.add(content_hash)
+            
+            # Estimate tokens
+            content_tokens = self._estimate_tokens(content)
+            title_tokens = self._estimate_tokens(title) if title else 0
+            section_tokens = content_tokens + title_tokens
+            
+            # Check if we can fit this section
+            if total_tokens + section_tokens > max_tokens:
+                # Try to include partial content with query-relevant excerpts
+                remaining_tokens = max_tokens - total_tokens
+                if remaining_tokens > 100:  # Only if we have meaningful space
+                    partial_content = self._extract_query_relevant_excerpt(
+                        content, query_keywords, remaining_tokens * 4
+                    )
+                    if partial_content:
+                        section_text = f"**{title}**\n{partial_content}..." if title else f"{partial_content}..."
+                        compressed_sections.append(section_text)
+                break
+            
+            # Add full content with formatting
+            if title:
+                section_text = f"**{title}**\n{content}"
+            else:
+                section_text = content
+                
+            compressed_sections.append(section_text)
+            total_tokens += section_tokens
+        
+        return "\n\n---\n\n".join(compressed_sections)
+    
+    def _extract_query_relevant_excerpt(self, content: str, query_keywords: set, max_chars: int) -> str:
+        """Extract the most relevant excerpt from content based on query keywords."""
+        if not query_keywords or not content:
+            return content[:max_chars]
+        
+        sentences = self._split_into_sentences(content)
+        
+        # Score sentences by keyword relevance
+        scored_sentences = []
+        for sentence in sentences:
+            sentence_tokens = set(self._advanced_tokenize_for_bm25(sentence.lower()))
+            overlap = len(query_keywords.intersection(sentence_tokens))
+            if overlap > 0:
+                scored_sentences.append((sentence, overlap))
+        
+        if not scored_sentences:
+            # No keyword matches, return beginning
+            return content[:max_chars]
+        
+        # Sort by relevance score
+        scored_sentences.sort(key=lambda x: x[1], reverse=True)
+        
+        # Build excerpt from most relevant sentences
+        excerpt_parts = []
+        current_length = 0
+        
+        for sentence, score in scored_sentences:
+            if current_length + len(sentence) > max_chars:
+                break
+            excerpt_parts.append(sentence)
+            current_length += len(sentence) + 1
+        
+        return " ".join(excerpt_parts)
+    
+    def create_vector_store(self) -> Dict:
+        """Create advanced hybrid RAG system with enhanced processing."""
+        pdf_files = list(self.data_folder.glob("*.pdf"))
+        
+        if not pdf_files:
+            return {"success": False, "message": "No PDF files found in data folder"}
+        
+        # Enhanced capacity with hybrid approach
+        max_files = 20  # Increased from 15
+        if len(pdf_files) > max_files:
+            st.warning(f"Processing first {max_files} of {len(pdf_files)} files")
+            pdf_files = pdf_files[:max_files]
+        
+        all_chunks = []
+        processing_stats = {"files": 0, "sections": 0, "chunks": 0, "metadata_items": 0}
+        
+        # Progress tracking
+        main_progress = st.progress(0)
+        main_status = st.empty()
+        start_time = time.time()
+        
+        # Phase 1: Intelligent preprocessing (35% of progress)
+        main_status.text("🧠 Advanced preprocessing and structure extraction...")
+        
+        for file_idx, pdf_file in enumerate(pdf_files):
+            # Extract text with better handling
+            text = self.extract_text_from_pdf(pdf_file)
+            if not text:
+                continue
+            
+            # Advanced preprocessing
+            processed = self.intelligent_text_preprocessing(text)
+            processing_stats["sections"] += len(processed["sections"])
+            processing_stats["metadata_items"] += len(processed["metadata"])
+            
+            # Enhanced chunking
+            chunks = self.intelligent_chunking(processed["sections"])
+            processing_stats["chunks"] += len(chunks)
+            
+            # Add enriched metadata
+            for chunk in chunks:
+                chunk["source"] = pdf_file.name
+                chunk["file_metadata"] = processed["metadata"]
+                chunk["file_index"] = file_idx
+            
+            all_chunks.extend(chunks)
+            processing_stats["files"] += 1
+            
+            # Update progress
+            file_progress = (file_idx + 1) / len(pdf_files) * 0.35
+            main_progress.progress(file_progress)
+        
+        if not all_chunks:
+            return {"success": False, "message": "No content extracted from PDF files"}
+        
+        # Limit chunks if too many
+        if len(all_chunks) > self.max_chunks_per_file * len(pdf_files):
+            max_total_chunks = self.max_chunks_per_file * len(pdf_files)
+            st.info(f"Limiting to {max_total_chunks} chunks for optimal performance")
+            all_chunks = all_chunks[:max_total_chunks]
+            processing_stats["chunks"] = len(all_chunks)
+        
+        main_status.text(f"📊 Creating hybrid indices for {len(all_chunks)} chunks...")
+        main_progress.progress(0.35)
+        
+        # Phase 2: Create hybrid indices (55% of progress)
+        try:
+            indices = self.create_hybrid_search_index(all_chunks)
+            main_progress.progress(0.9)
+        except Exception as e:
+            return {"success": False, "message": f"Error creating indices: {str(e)}"}
+        
+        # Phase 3: Save everything (10% of progress)
+        main_status.text("💾 Saving hybrid RAG system...")
+        
+        try:
+            self.save_hybrid_indices(indices)
+        except Exception as e:
+            return {"success": False, "message": f"Error saving: {str(e)}"}
+        
+        # Complete with detailed stats
+        total_time = time.time() - start_time
+        main_progress.progress(1.0)
+        main_status.text(f"✅ Hybrid RAG system created in {total_time:.1f}s!")
+        
+        search_types = ["Dense Vector"]
+        if self.use_bm25:
+            search_types.append("Sparse BM25")
+        
+        return {
+            "success": True,
+            "message": f"Hybrid RAG created: {processing_stats['chunks']} chunks from {processing_stats['files']} files ({', '.join(search_types)})",
+            "chunks": processing_stats["chunks"],
+            "files": processing_stats["files"],
+            "sections": processing_stats["sections"],
+            "metadata_items": processing_stats["metadata_items"],
+            "time": total_time,
+            "search_types": search_types
+        }
+    
+    def save_hybrid_indices(self, indices: Dict):
+        """Save hybrid indices with enhanced metadata."""
+        # Save vector index
+        if indices["vector_index"]:
+            vector_path = self.vector_store_path / "faiss_index.bin"
+            faiss.write_index(indices["vector_index"], str(vector_path))
+        
+        # Save comprehensive metadata
+        metadata_path = self.vector_store_path / "hybrid_metadata.pkl"
+        save_data = {
+            "metadata": indices["metadata"],
+            "bm25_index": indices["bm25_index"],
+            "tokenized_docs": indices.get("tokenized_docs"),
+            "creation_time": time.time(),
+            "system_info": {
+                "chunk_size": self.chunk_size,
+                "chunk_overlap": self.chunk_overlap,
+                "use_bm25": self.use_bm25,
+                "embedding_model": self.embedding_model
+            }
+        }
+        
+        with open(metadata_path, 'wb') as f:
+            pickle.dump(save_data, f)
+    
+    def load_hybrid_indices(self) -> Dict:
+        """Load hybrid indices with validation."""
+        vector_path = self.vector_store_path / "faiss_index.bin"
+        metadata_path = self.vector_store_path / "hybrid_metadata.pkl"
+        
+        if not (vector_path.exists() and metadata_path.exists()):
+            return {}
+        
+        try:
+            # Load vector index
+            vector_index = faiss.read_index(str(vector_path))
+            
+            # Load metadata with validation
+            with open(metadata_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            # Validate data structure
+            metadata = data.get("metadata", [])
+            if not isinstance(metadata, list):
+                raise ValueError("Invalid metadata format")
+            
+            return {
+                "vector_index": vector_index,
+                "bm25_index": data.get("bm25_index"),
+                "metadata": metadata,
+                "tokenized_docs": data.get("tokenized_docs"),
+                "system_info": data.get("system_info", {})
+            }
+        except Exception as e:
+            st.error(f"Error loading hybrid indices: {str(e)}")
+            return {}
+    
+    def extract_text_from_pdf(self, pdf_path: Path) -> str:
+        """Enhanced PDF text extraction with better error handling."""
+        try:
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                # Increased page limit for hybrid system
+                max_pages = min(200, len(pdf_reader.pages))
+                text_parts = []
+                
+                for i, page in enumerate(pdf_reader.pages[:max_pages]):
+                    try:
+                        text = page.extract_text()
+                        if text and text.strip():
+                            # Basic cleaning
+                            text = re.sub(r'\s+', ' ', text.strip())
+                            text_parts.append(text)
+                    except Exception as page_error:
+                        # Continue with other pages if one fails
+                        continue
+                
+                if not text_parts:
+                    return ""
+                
+                full_text = "\n".join(text_parts)
+                
+                if len(pdf_reader.pages) > max_pages:
+                    st.info(f"Processed {max_pages} of {len(pdf_reader.pages)} pages from {pdf_path.name}")
+                
+                return full_text
+                
+        except Exception as e:
+            st.error(f"Error reading PDF {pdf_path.name}: {str(e)}")
+            return ""
+    
+    def search_similar(self, query: str, k: int = 8) -> List[Dict]:
+        """Main search interface using advanced hybrid approach."""
+        try:
+            # Use enhanced hybrid search
+            results = self.hybrid_search(query, k)
+            
+            # Ensure full content is available for display
+            indices = self.load_hybrid_indices()
+            if indices and indices["metadata"]:
+                metadata = indices["metadata"]
+                for result in results:
+                    chunk_id = result.get("chunk_id", -1)
+                    if 0 <= chunk_id < len(metadata):
+                        # Metadata now stores full content
+                        result["content"] = metadata[chunk_id].get("content", result.get("content", ""))
+            
+            return results
+            
+        except Exception as e:
+            st.error(f"Hybrid search error: {str(e)}")
+            return []
 
 class ToolPlugin:
     """A plugin that exposes tools for the chatbot."""
@@ -707,23 +1032,23 @@ async def process_request(kernel, category, function_name):
         st.error(f"Error calling function: {e}")
         return f"Request logged successfully (local fallback)."
 
-def create_optimized_vector_store_ui(openai_client, model_name):
-    """Enhanced RAG UI for vector store management."""
+def create_hybrid_vector_store_ui(openai_client, model_name):
+    """Hybrid RAG UI for vector store management."""
     st.sidebar.markdown("---")
-    st.sidebar.header("📚 Enhanced RAG Knowledge Base")
+    st.sidebar.header("📚 Hybrid RAG Knowledge Base")
     
     # Check if vector store dependencies are available
     if not VECTOR_STORE_AVAILABLE:
         st.sidebar.error("❌ Vector store dependencies not installed")
-        st.sidebar.code("pip install faiss-cpu PyPDF2")
+        st.sidebar.code("pip install faiss-cpu PyPDF2 rank-bm25")
         return None
     
-    # Initialize optimized vector store manager
+    # Initialize hybrid RAG manager
     if "vector_manager" not in st.session_state:
         try:
-            st.session_state.vector_manager = OptimizedVectorStoreManager(openai_client, model_name)
+            st.session_state.vector_manager = HybridRAGManager(openai_client, model_name)
         except Exception as e:
-            st.sidebar.error(f"Error initializing vector store: {str(e)}")
+            st.sidebar.error(f"Error initializing hybrid RAG: {str(e)}")
             return None
     
     vector_manager = st.session_state.vector_manager
@@ -735,87 +1060,104 @@ def create_optimized_vector_store_ui(openai_client, model_name):
     st.sidebar.markdown(f"**PDF Files in Data Folder:** {len(pdf_files)}")
     
     # Show improved limits
-    if len(pdf_files) > 10:
-        st.sidebar.warning(f"⚠️ {len(pdf_files)} PDF files found. First 10 will be processed for optimal performance.")
+    if len(pdf_files) > 15:
+        st.sidebar.warning(f"⚠️ {len(pdf_files)} PDF files found. First 15 will be processed for optimal performance.")
     
     if pdf_files:
         with st.sidebar.expander("📄 Available PDF Files", expanded=False):
-            for i, pdf_file in enumerate(pdf_files[:15]):  # Show more in list
-                status = "✅" if i < 10 else "⏳"
+            for i, pdf_file in enumerate(pdf_files[:20]):  # Show more in list
+                status = "✅" if i < 15 else "⏳"
                 file_size = pdf_file.stat().st_size / 1024  # KB
                 st.write(f"{status} {pdf_file.name} ({file_size:.0f}KB)")
-            if len(pdf_files) > 15:
-                st.write(f"... and {len(pdf_files) - 15} more files")
+            if len(pdf_files) > 20:
+                st.write(f"... and {len(pdf_files) - 20} more files")
     else:
         st.sidebar.warning("⚠️ No PDF files found in 'data' folder")
-        st.sidebar.markdown("*Place PDF files in the 'data' folder to create vector store*")
+        st.sidebar.markdown("*Place PDF files in the 'data' folder to create hybrid RAG*")
     
-    # Enhanced RAG performance tips
-    st.sidebar.info("⚡ **Enhanced RAG Features:**\n- Context-aware follow-up questions\n- Multi-strategy search (vector + keyword + expansion)\n- Process up to 10 files\n- Files up to 10MB supported\n- Better chunking with overlap\n- Query expansion for better matching\n- Lenient similarity thresholds")
+    # Hybrid RAG features info
+    st.sidebar.info("⚡ **Hybrid RAG Features:**\n- Context-aware follow-up questions\n- Vector + BM25 sparse search\n- Intelligent preprocessing\n- Context compression\n- Structure-aware chunking\n- Process up to 15 files\n- Files up to 15MB supported\n- Reciprocal rank fusion")
     
-    # Check if vector store exists
-    vector_store_exists = vector_manager.load_vector_store()[0] is not None
+    # Check if hybrid indices exist
+    indices = vector_manager.load_hybrid_indices()
+    vector_store_exists = bool(indices and indices.get("metadata"))
     
     if vector_store_exists:
-        st.sidebar.success("✅ Vector store exists")
+        st.sidebar.success("✅ Hybrid RAG system exists")
         
-        # Show vector store info
+        # Show hybrid RAG info
         try:
-            index, metadata = vector_manager.load_vector_store()
-            if index and metadata:
+            metadata = indices.get("metadata", [])
+            if metadata:
                 st.sidebar.markdown(f"**Chunks:** {len(metadata)}")
-                st.sidebar.markdown(f"**Index Size:** {index.ntotal} vectors")
                 
                 # Get unique sources
-                sources = set(item["source"] for item in metadata)
+                sources = set(item["source"] for item in metadata if "source" in item)
                 st.sidebar.markdown(f"**Sources:** {len(sources)}")
+                
+                # Show search capabilities
+                search_types = ["Vector Search"]
+                if indices.get("bm25_index") and BM25_AVAILABLE:
+                    search_types.append("BM25 Sparse")
+                st.sidebar.markdown(f"**Search Types:** {', '.join(search_types)}")
         except:
             pass
     else:
-        st.sidebar.info("ℹ️ No vector store found")
+        st.sidebar.info("ℹ️ No hybrid RAG system found")
     
-    # Create/Recreate vector store button
-    button_text = "🔄 Recreate Enhanced RAG Store" if vector_store_exists else "⚡ Create Enhanced RAG Store"
+    # Create/Recreate hybrid RAG button
+    button_text = "🔄 Recreate Hybrid RAG" if vector_store_exists else "⚡ Create Hybrid RAG"
     
     if st.sidebar.button(button_text, disabled=(len(pdf_files) == 0)):
         if len(pdf_files) == 0:
             st.sidebar.error("❌ No PDF files found to process")
         else:
             with st.sidebar:
-                st.markdown("### 🚀 Creating Enhanced RAG System")
+                st.markdown("### 🚀 Creating Hybrid RAG System")
                 try:
                     result = vector_manager.create_vector_store()
                     
                     if result["success"]:
                         st.success(f"✅ {result['message']}")
                         st.balloons()
+                        
+                        # Show search capabilities
+                        if "search_types" in result:
+                            st.info(f"🔍 Search types: {', '.join(result['search_types'])}")
                     else:
                         st.error(f"❌ {result['message']}")
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
     
-    # Enhanced RAG search interface
+    # Hybrid RAG search interface
     if vector_store_exists:
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🔍 Enhanced RAG Search")
+        st.sidebar.subheader("🔍 Hybrid RAG Search")
         
         search_query = st.sidebar.text_input("Search query:", placeholder="Search in PDFs...")
         
-        if st.sidebar.button("🔍 Enhanced Search") and search_query:
+        if st.sidebar.button("🔍 Hybrid Search") and search_query:
             with st.sidebar:
                 with st.spinner("Searching..."):
                     try:
                         start_time = time.time()
-                        results = vector_manager.search_similar(search_query, k=3)
+                        results = vector_manager.search_similar(search_query, k=5)
                         search_time = time.time() - start_time
                         
                         if results:
                             st.success(f"Found {len(results)} results in {search_time:.2f}s")
                             for i, result in enumerate(results, 1):
-                                with st.expander(f"Result {i} - {result['source']}", expanded=(i==1)):
-                                    st.write(f"**Source:** {result['source']}")
-                                    st.write(f"**Content:** {result['content']}")
-                                    st.write(f"**Similarity:** {result['similarity_score']:.4f}")
+                                with st.expander(f"Result {i} - {result.get('source', 'Unknown')}", expanded=(i==1)):
+                                    st.write(f"**Source:** {result.get('source', 'Unknown')}")
+                                    st.write(f"**Content:** {result.get('content', '')[:200]}...")
+                                    
+                                    # Show search type if available
+                                    search_type = result.get('search_type', 'hybrid')
+                                    rrf_score = result.get('rrf_score')
+                                    if rrf_score:
+                                        st.write(f"**Type:** {search_type} (RRF: {rrf_score:.4f})")
+                                    else:
+                                        st.write(f"**Similarity:** {result.get('similarity_score', 0):.4f}")
                         else:
                             st.info("No relevant results found")
                     except Exception as e:
@@ -887,16 +1229,16 @@ def handle_agent_conversation(category):
         
         # Check if vector store exists
         if "vector_manager" not in st.session_state:
-            st.error("❌ Vector store not initialized. Please create a vector store first.")
+            st.error("❌ Hybrid RAG not initialized. Please create a hybrid RAG system first.")
             if st.button("Return to Main Agent"):
                 return True
             return False
         
         vector_manager = st.session_state.vector_manager
-        index, metadata = vector_manager.load_vector_store()
+        indices = vector_manager.load_hybrid_indices()
         
-        if index is None or metadata is None:
-            st.error("❌ No vector store found. Please create a vector store first by uploading PDFs.")
+        if not indices or not indices.get("metadata"):
+            st.error("❌ No hybrid RAG system found. Please create one first by uploading PDFs.")
             if st.button("Return to Main Agent"):
                 return True
             return False
@@ -905,8 +1247,8 @@ def handle_agent_conversation(category):
         original_query = st.session_state.get('original_user_query', '')
         
         if original_query and not st.session_state.get('kb_query_processed', False):
-            # Process the original query directly
-            with st.spinner("🔍 Searching..."):
+            # Process the original query directly with hybrid RAG
+            with st.spinner("🔍 Hybrid searching..."):
                 try:
                     start_time = time.time()
                     
@@ -914,85 +1256,80 @@ def handle_agent_conversation(category):
                     general_queries = ["what information", "what's in", "what is in", "what does the document contain", "what topics", "summarize", "overview", "what's available"]
                     is_general_query = any(phrase in original_query.lower() for phrase in general_queries)
                     
+                    # Use hybrid search with appropriate parameters
                     if is_general_query:
-                        # For general queries, get more results
-                        results = vector_manager.search_similar(original_query, k=15)
-                        similarity_threshold = 5.0  # Very lenient for general queries
+                        results = vector_manager.search_similar(original_query, k=12)
                     else:
-                        # For specific queries, use enhanced search
-                        results = vector_manager.search_similar(original_query, k=10)
-                        similarity_threshold = 3.0  # Much more lenient
+                        results = vector_manager.search_similar(original_query, k=8)
                     
                     search_time = time.time() - start_time
                     
-                    # Always try to use results if we have any, regardless of similarity score
+                    # Always try to use results if we have any
                     if results:
-                        # Create a simple, clean answer
+                        # Use context compression for better LLM input
+                        max_tokens = 6000 if is_general_query else 4000
+                        compressed_context = vector_manager.context_compression(results, original_query, max_tokens)
+                        
+                        # Create enhanced answer with hybrid RAG
                         answer_parts = []
                         
-                        # Try to generate AI summary first
+                        # Try to generate AI summary with compressed context
                         ai_summary_generated = False
                         try:
                             openai_client = st.session_state.get('openai_client')
                             model_name = os.getenv("DEPLOYMENT_NAME")
                             
-                            if openai_client and model_name:
-                                # Use more content for better context
-                                num_contexts = 6 if is_general_query else 4
-                                context = "\n\n".join([r['content'] for r in results[:num_contexts]])
-                                if len(context) > 8000:  # Increased limit
-                                    context = context[:8000] + "..."
-                                
+                            if openai_client and model_name and compressed_context:
                                 if is_general_query:
                                     summary_prompt = f"""Based on the following content from documents, provide a comprehensive overview of what information is available in the knowledge base.
 
 User Question: {original_query}
 
 Document Content:
-{context}
+{compressed_context}
 
 Please provide a helpful summary of the main topics, types of information, and key content available in these documents. Be comprehensive and informative."""
                                 else:
-                                    summary_prompt = f"""Based on the following content from documents, provide a clear and helpful answer to the user's question. Focus on directly answering what was asked.
+                                    summary_prompt = f"""Based on the following content from documents, provide a clear and direct answer to the user's question. Extract specific facts and details that answer the question.
 
 User Question: {original_query}
 
 Relevant Content:
-{context}
+{compressed_context}
 
-Please provide a direct, accurate answer based on the content above. Extract specific facts and details that answer the question."""
+Please provide a direct, accurate answer based on the content above. Focus on answering the specific question asked with concrete details and facts from the documents."""
 
                                 response = openai_client.chat.completions.create(
                                     model=model_name,
                                     messages=[{"role": "user", "content": summary_prompt}],
-                                    temperature=0.1,  # Lower temperature for more factual responses
-                                    max_tokens=700
+                                    temperature=0.05,  # Very low temperature for factual accuracy
+                                    max_tokens=800
                                 )
                                 
                                 ai_summary = response.choices[0].message.content.strip()
+                                
+                                # Add search metadata
+                                search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
+                                #answer_parts.append(ai_summary + search_info)
                                 answer_parts.append(ai_summary)
                                 ai_summary_generated = True
                                 
                         except Exception as e:
-                            # Silently fall back to showing raw results
+                            # Silently fall back to showing compressed content
                             pass
                         
-                        # If no AI summary, show the most relevant content
+                        # If no AI summary, show compressed content directly
                         if not ai_summary_generated:
                             if is_general_query:
                                 answer_parts.append("Based on your documents, here's what information is available:")
-                                # Show more results for general queries
-                                for i, result in enumerate(results[:5], 1):
-                                    answer_parts.append(f"\n**Section {i} (from {result['source']}):**")
-                                    # Show more content for overview
-                                    content = result['content'][:500] + "..." if len(result['content']) > 500 else result['content']
-                                    answer_parts.append(content)
+                                answer_parts.append(compressed_context)
                             else:
                                 answer_parts.append("Based on your documents:")
-                                # Show top 3 results with full content
-                                for i, result in enumerate(results[:3], 1):
-                                    answer_parts.append(f"\n**From {result['source']}:**")
-                                    answer_parts.append(result['content'])
+                                answer_parts.append(compressed_context)
+                            
+                            # Add search metadata
+                            search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
+                            answer_parts.append(search_info)
                         
                         final_answer = "\n".join(answer_parts)
                         
@@ -1004,15 +1341,16 @@ Please provide a direct, accurate answer based on the content above. Extract spe
                     else:
                         # If no results found, show sample content from the knowledge base
                         try:
-                            index, metadata = vector_manager.load_vector_store()
+                            indices = vector_manager.load_hybrid_indices()
+                            metadata = indices.get("metadata", [])
                             if metadata and len(metadata) > 0:
                                 sample_content = []
                                 sample_content.append("I couldn't find specific matches for your query, but here's a sample of what's in your knowledge base:")
                                 
                                 # Show first few chunks as samples
                                 for i, item in enumerate(metadata[:4], 1):
-                                    sample_content.append(f"\n**Sample {i} (from {item['source']}):**")
-                                    content = item['content'][:400] + "..." if len(item['content']) > 400 else item['content']
+                                    sample_content.append(f"\n**Sample {i} (from {item.get('source', 'Unknown')}):**")
+                                    content = item.get('content', '')[:400] + "..." if len(item.get('content', '')) > 400 else item.get('content', '')
                                     sample_content.append(content)
                                 
                                 sample_content.append(f"\n*Total content: {len(metadata)} sections across your documents*")
@@ -1053,54 +1391,60 @@ Please provide a direct, accurate answer based on the content above. Extract spe
                 submitted = st.form_submit_button("🔍 Search", type="primary")
                 
                 if submitted and query.strip():
-                    with st.spinner("🔍 Searching..."):
+                    with st.spinner("🔍 Hybrid searching..."):
                         try:
+                            start_time = time.time()
                             results = vector_manager.search_similar(query.strip(), k=8)
+                            search_time = time.time() - start_time
                             
                             # Always try to use results if we have any
                             if results:
+                                # Use context compression
+                                compressed_context = vector_manager.context_compression(results, query.strip(), 4000)
+                                
                                 answer_parts = []
                                 
-                                # Try AI summary first
+                                # Try AI summary with compressed context
                                 ai_summary_generated = False
                                 try:
                                     openai_client = st.session_state.get('openai_client')
                                     model_name = os.getenv("DEPLOYMENT_NAME")
                                     
-                                    if openai_client and model_name:
-                                        context = "\n\n".join([r['content'] for r in results[:4]])
-                                        if len(context) > 8000:
-                                            context = context[:8000] + "..."
-                                        
+                                    if openai_client and model_name and compressed_context:
                                         summary_prompt = f"""Based on the following content from documents, provide a clear and helpful answer to the user's question. Focus on directly answering what was asked.
 
 User Question: {query}
 
 Relevant Content:
-{context}
+{compressed_context}
 
 Please provide a direct, accurate answer based on the content above. Extract specific facts and details that answer the question."""
 
                                         response = openai_client.chat.completions.create(
                                             model=model_name,
                                             messages=[{"role": "user", "content": summary_prompt}],
-                                            temperature=0.1,
+                                            temperature=0.05,
                                             max_tokens=700
                                         )
                                         
                                         ai_summary = response.choices[0].message.content.strip()
-                                        answer_parts.append(ai_summary)
+                                        
+                                        # Add search metadata
+                                        search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
+                                        answer_parts.append(ai_summary + search_info)
                                         ai_summary_generated = True
                                         
                                 except:
                                     pass
                                 
-                                # Fallback to raw results
+                                # Fallback to compressed content
                                 if not ai_summary_generated:
                                     answer_parts.append("Based on your documents:")
-                                    for i, result in enumerate(results[:3], 1):
-                                        answer_parts.append(f"\n**From {result['source']}:**")
-                                        answer_parts.append(result['content'])
+                                    answer_parts.append(compressed_context)
+                                    
+                                    # Add search metadata
+                                    search_info = f"\n\n*📊 Hybrid search found {len(results)} relevant sections in {search_time:.2f}s*"
+                                    answer_parts.append(search_info)
                                 
                                 final_answer = "\n".join(answer_parts)
                                 st.session_state.agent_complete = True
@@ -1139,8 +1483,8 @@ def main():
         layout="wide"
     )
 
-    st.title("🚀 Multi-Agent Assistant with Enhanced RAG")
-    st.markdown("Featuring **ultra-fast vector store creation**, **advanced multi-strategy RAG search**, **context-aware conversations**, and optimized processing for all your requests.")
+    st.title("🚀 Multi-Agent Assistant with Hybrid RAG")
+    st.markdown("Featuring **ultra-fast hybrid RAG creation**, **vector + sparse search**, **intelligent preprocessing**, **context compression**, and optimized processing for all your requests.")
 
     # Initialize chatbot
     kernel, chat_service, openai_client = initialize_chatbot()
@@ -1162,8 +1506,8 @@ def main():
     
     show_debug_panel(openai_client, model_name, base_endpoint, api_version, api_key)
 
-    # Add optimized vector store UI to sidebar
-    vector_manager = create_optimized_vector_store_ui(openai_client, model_name)
+    # Add hybrid RAG UI to sidebar
+    vector_manager = create_hybrid_vector_store_ui(openai_client, model_name)
     
     # Store openai_client in session state for knowledge base agent
     st.session_state.openai_client = openai_client
@@ -1293,7 +1637,7 @@ def main():
 
     # Enhanced sidebar with performance info
     with st.sidebar:
-        st.header("🚀 Enhanced Multi-Agent Services")
+        st.header("🚀 Advanced Multi-Agent Services")
         st.markdown("""
         **I can help you with:**
         
@@ -1313,13 +1657,14 @@ def main():
         - Transportation, rides, car services
         - *No additional info required*
         
-        📚 **Enhanced RAG Search**
-        - Multi-strategy document search (vector + keyword + expansion)
+        📚 **Hybrid RAG Search**
+        - Advanced hybrid retrieval (Vector + BM25 sparse search)
+        - Intelligent preprocessing and context compression
         - Context-aware follow-up questions
-        - Ask questions about uploaded PDFs with improved accuracy
-        - Get AI-powered summaries with better context
-        - Works even with difficult queries
-        - *Requires: Vector store with PDFs*
+        - Ask questions about uploaded PDFs with superior accuracy
+        - Get AI-powered summaries with optimal context
+        - Works with difficult and complex queries
+        - *Requires: Hybrid RAG system with PDFs*
         """)
         
         st.header("💡 Example Requests")
@@ -1330,7 +1675,7 @@ def main():
         - "Feeling really drained"
         - "Can you get me a ride?"
         
-        **Enhanced RAG Queries:**
+        **Hybrid RAG Queries:**
         - "How many years of experience does [person] have?"
         - "What skills are mentioned in the resume?"
         - "Find information about XYZ"
@@ -1349,48 +1694,53 @@ def main():
         if st.session_state.get('last_successful_category') == "Search Knowledge Base":
             st.info("🔗 **Context Active**: Follow-up questions will automatically use the Knowledge Base")
         
-        st.header("⚡ Advanced RAG Features")
+        st.header("⚡ Hybrid RAG Features")
         st.markdown("""
+        - **Hybrid retrieval**: Vector search + BM25 sparse search
+        - **Intelligent preprocessing**: Structure-aware text processing
+        - **Context compression**: Optimal context for LLM generation
+        - **Reciprocal rank fusion**: Combines multiple search strategies
         - **Context-aware conversations**: Follow-up questions automatically use Knowledge Base
-        - **Multi-strategy search**: Vector + keyword + query expansion
         - **Enhanced chunking**: Better overlap and sizing for RAG
         - **Intelligent prompting**: Optimized for factual extraction
-        - **Lenient matching**: Finds relevant content even with low similarity
         - **Query expansion**: Automatically tries related terms
-        - **Fallback search**: Keyword matching when vector search fails
-        - **Ultra-fast** vector store creation
+        - **Ultra-fast** hybrid system creation
         - **Batch processing** for embeddings
         - **GPU acceleration** when available
         - **Smart memory management**
-        - **Process up to 10 PDF files**
-        - **Files up to 10MB supported**
+        - **Process up to 15 PDF files**
+        - **Files up to 15MB supported**
         """)
         
         # Show knowledge base status
         if VECTOR_STORE_AVAILABLE and "vector_manager" in st.session_state:
             vector_manager = st.session_state.vector_manager
-            index, metadata = vector_manager.load_vector_store()
-            if index is not None and metadata is not None:
-                sources = set(item["source"] for item in metadata)
-                st.success(f"📚 Enhanced RAG Ready: {len(sources)} documents, {len(metadata)} chunks")
+            indices = vector_manager.load_hybrid_indices()
+            if indices and indices.get("metadata"):
+                metadata = indices["metadata"]
+                sources = set(item.get("source", "") for item in metadata)
+                search_types = ["Vector"]
+                if indices.get("bm25_index") and BM25_AVAILABLE:
+                    search_types.append("BM25")
+                st.success(f"📚 Hybrid RAG Ready: {len(sources)} documents, {len(metadata)} chunks ({'+'.join(search_types)})")
                 
                 # Show context status in sidebar too
                 if st.session_state.get('last_successful_category') == "Search Knowledge Base":
                     st.info("🔗 Context Active: Next questions will use Knowledge Base")
             else:
-                st.info("📚 Knowledge Base: Not created yet")
+                st.info("📚 Hybrid RAG: Not created yet")
         
         st.markdown("---")
         st.header("🔧 Installation & Setup")
         st.markdown("""
-        **For CPU-only (Recommended):**
+        **For Hybrid RAG (Recommended):**
         ```bash
-        pip install faiss-cpu PyPDF2
+        pip install faiss-cpu PyPDF2 rank-bm25
         ```
         
         **For GPU acceleration:**
         ```bash
-        pip install faiss-gpu PyPDF2
+        pip install faiss-gpu PyPDF2 rank-bm25
         ```
         
         **Environment Variables Required:**
@@ -1407,25 +1757,27 @@ def main():
         - ✅ Ensure deployment is active in Azure Portal
         - ✅ Test connection using the debug panel above
         
-        **Performance Tips:**
-        - Use PDF files under 10MB for best performance
-        - Process up to 10 files at once  
-        - Enhanced RAG uses multi-strategy search for better results
+        **Hybrid RAG Features:**
+        - Use PDF files under 15MB for best performance
+        - Process up to 15 files at once  
+        - Hybrid search combines vector similarity with BM25 sparse search
+        - Intelligent preprocessing extracts structure and metadata
+        - Context compression optimizes LLM input for better answers
         - GPU acceleration used automatically when available
-        - Optimized batch processing for fast embedding generation
-        - Better chunking strategy improves answer quality
+        - Reciprocal rank fusion combines multiple search strategies
         """)
         
         # Show current performance status
         if VECTOR_STORE_AVAILABLE:
             gpu_status = "🚀 GPU Accelerated" if GPU_AVAILABLE else "💻 CPU Optimized"
-            st.markdown(f"**Status:** {gpu_status}")
+            bm25_status = "🔍 BM25 Available" if BM25_AVAILABLE else "❌ BM25 Missing"
+            st.markdown(f"**Status:** {gpu_status} | {bm25_status}")
             
         # Show AI summary status
         if "openai_client" in st.session_state:
-            st.markdown("**Enhanced RAG:** ⚡ Multi-strategy search available")
+            st.markdown("**Hybrid RAG:** ⚡ Full system available")
         else:
-            st.markdown("**Enhanced RAG:** ❌ Configuration issue")
+            st.markdown("**Hybrid RAG:** ❌ Configuration issue")
         
         if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []
