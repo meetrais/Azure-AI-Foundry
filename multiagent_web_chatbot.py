@@ -85,36 +85,14 @@ class ModernRAGManager:
         self.max_chunks_per_file = 150
         
         self._initialize_tokenizer()
-        self._show_capabilities()
     
     def _initialize_tokenizer(self):
         """Initialize tokenizer for proper token counting."""
         try:
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
-            st.info("✅ Initialized tiktoken tokenizer for GPT-4")
         except Exception as e:
             st.warning(f"⚠️ Tokenizer initialization failed: {e}")
             self.tokenizer = None
-    
-    def _show_capabilities(self):
-        """Show modern RAG capabilities."""
-        if self.use_gpu:
-            st.info(f"🚀 GPU acceleration enabled! Found {faiss.get_num_gpus()} GPU(s)")
-        
-        if self.use_bm25:
-            st.info("🔍 Hybrid retrieval available (Vector + BM25)")
-        else:
-            st.warning("⚠️ BM25 not available. Install: pip install rank-bm25")
-        
-        techniques = []
-        if self.use_hyde:
-            techniques.append("HyDE")
-        if self.use_query_expansion:
-            techniques.append("Query Expansion")
-        if self.use_mmr:
-            techniques.append("MMR")
-        
-        st.info(f"✨ Modern RAG techniques: {', '.join(techniques)}, Token-based chunking, Sentence Window")
     
     def count_tokens(self, text: str) -> int:
         """Count tokens in text using tiktoken."""
@@ -1423,8 +1401,6 @@ async def process_request(kernel, category, function_name):
 
 def create_modern_rag_ui(openai_client, model_name):
     """Modern RAG UI with latest techniques."""
-    st.sidebar.markdown("---")
-    st.sidebar.header("🚀 Modern RAG System")
     
     if not VECTOR_STORE_AVAILABLE:
         st.sidebar.error("❌ Dependencies not installed")
@@ -1445,8 +1421,6 @@ def create_modern_rag_ui(openai_client, model_name):
     data_folder = Path("data")
     pdf_files = list(data_folder.glob("*.pdf")) if data_folder.exists() else []
     
-    st.sidebar.markdown(f"**PDF Files:** {len(pdf_files)}")
-    
     if pdf_files:
         with st.sidebar.expander("📄 PDF Files", expanded=False):
             for pdf_file in pdf_files[:25]:
@@ -1456,56 +1430,12 @@ def create_modern_rag_ui(openai_client, model_name):
     else:
         st.sidebar.warning("⚠️ No PDF files found in 'data' folder")
     
-    # Features
-    st.sidebar.info("""⚡ **Modern RAG Features:**
-- **Token-based chunking** with tiktoken
-- **Recursive text splitting** (LangChain-style)
-- **Parent-child chunks** for context
-- **Sentence window** retrieval
-- **HyDE** (Hypothetical Document Embeddings)
-- **Query expansion** with LLM
-- **MMR** (Maximal Marginal Relevance)
-- **Hybrid search** (Vector + BM25)
-- **Cosine similarity** with normalized embeddings
-- **Support up to 25 PDF files**
-- **GPU acceleration** when available
-""")
-    
     # Check if system exists
     indices = manager.load_indices()
     system_exists = bool(indices and indices.get("metadata"))
     
     if system_exists:
         st.sidebar.success("✅ Modern RAG System exists")
-        
-        metadata = indices.get("metadata", [])
-        parent_metadata = indices.get("parent_metadata", [])
-        
-        if metadata:
-            st.sidebar.markdown(f"**Child Chunks:** {len(metadata)}")
-            st.sidebar.markdown(f"**Parent Chunks:** {len(parent_metadata)}")
-            
-            # Show statistics
-            total_tokens = sum(item.get("tokens", 0) for item in metadata)
-            st.sidebar.markdown(f"**Total Tokens:** {total_tokens:,}")
-            
-            sources = set(item.get("source", "") for item in metadata)
-            st.sidebar.markdown(f"**Sources:** {len(sources)}")
-            
-            # Show techniques used
-            system_info = indices.get("system_info", {})
-            techniques = []
-            if system_info.get("use_hyde"):
-                techniques.append("HyDE")
-            if system_info.get("use_query_expansion"):
-                techniques.append("Query Expansion")
-            if system_info.get("use_mmr"):
-                techniques.append("MMR")
-            if system_info.get("use_bm25"):
-                techniques.append("BM25")
-            
-            if techniques:
-                st.sidebar.markdown(f"**Techniques:** {', '.join(techniques)}")
     else:
         st.sidebar.info("ℹ️ No modern RAG system found")
     
@@ -1530,52 +1460,6 @@ def create_modern_rag_ui(openai_client, model_name):
                         st.error(f"❌ {result['message']}")
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
-    
-    # Search interface
-    if system_exists:
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🔍 Modern RAG Search")
-        
-        search_query = st.sidebar.text_input("Search:", placeholder="Ask about document content...")
-        
-        if st.sidebar.button("🚀 Modern Search") and search_query:
-            with st.sidebar:
-                with st.spinner("Searching with modern techniques..."):
-                    try:
-                        start_time = time.time()
-                        results = manager.modern_search(search_query, k=6)
-                        search_time = time.time() - start_time
-                        
-                        if results:
-                            st.success(f"Found {len(results)} results in {search_time:.2f}s")
-                            
-                            # Show preview
-                            for i, result in enumerate(results, 1):
-                                source = result.get("source", "Unknown")
-                                techniques = []
-                                if result.get("mmr_selected"):
-                                    techniques.append("MMR")
-                                if result.get("search_type"):
-                                    techniques.append(result["search_type"].upper())
-                                
-                                technique_str = f" ({', '.join(techniques)})" if techniques else ""
-                                
-                                with st.expander(f"Preview {i} - {source}{technique_str}", expanded=(i==1)):
-                                    content = result.get("content", "")[:200]
-                                    if len(result.get("content", "")) > 200:
-                                        content += "..."
-                                    
-                                    st.write(f"**Text:** {content}")
-                                    
-                                    # Show scores
-                                    if result.get("similarity_score") is not None:
-                                        st.caption(f"Similarity: {result['similarity_score']:.4f}")
-                                    if result.get("bm25_score"):
-                                        st.caption(f"BM25: {result['bm25_score']:.2f}")
-                        else:
-                            st.info("No results found")
-                    except Exception as e:
-                        st.error(f"Search error: {str(e)}")
     
     return manager
 
@@ -1747,7 +1631,7 @@ def handle_agent_conversation(category):
             from_date = st.date_input("From Date (sick leave start):")
             to_date = st.date_input("To Date (sick leave end):")
             
-            submitted = st.form_submit_button("Submit Report Sick Request")
+            submitted = st.form_submit_button("Submit Report Sick Request", type="primary")
             
             if submitted:
                 st.success(f"Thank you. I have recorded your sick leave from {from_date} to {to_date}.")
@@ -1863,14 +1747,12 @@ def handle_agent_conversation(category):
 
 def main():
     st.set_page_config(
-        page_title="Modern RAG Multi-Agent Assistant",
+        page_title="Advanced Multi-Agent Web Chatbot",
         page_icon="🚀",
         layout="wide"
     )
 
-    st.title("🚀 Modern RAG Multi-Agent Assistant")
-    st.markdown("Featuring **latest RAG techniques**: **Token-based chunking**, **HyDE**, **Query expansion**, **MMR**, **Sentence windows**, **Parent-child chunks**, **Hybrid search**, and **Advanced retrieval** for superior document understanding.")
-
+    st.title("🚀 Advanced Multi-Agent Web Chatbot")
     # Initialize chatbot
     kernel, chat_service, openai_client = initialize_chatbot()
     
@@ -2017,7 +1899,6 @@ def main():
 
     # Enhanced sidebar with modern RAG info
     with st.sidebar:
-        st.header("🚀 Modern RAG Multi-Agent Services")
         st.markdown("""
         **I can help you with:**
         
@@ -2037,17 +1918,7 @@ def main():
         - Transportation, rides, car services
         - *No additional info required*
         
-        🚀 **Modern RAG Search**
-        - **Token-based chunking** with tiktoken
-        - **HyDE** (Hypothetical Document Embeddings)
-        - **Query expansion** with LLM
-        - **MMR** (Maximal Marginal Relevance) for diversity
-        - **Sentence window** retrieval for context
-        - **Parent-child chunks** for better understanding
-        - **Hybrid search** (Vector + BM25)
-        - **Perfect for complex document queries**
-        - Ask questions about PDFs and get comprehensive answers
-        - *Requires: Modern RAG system with PDFs*
+        🚀 **Knowledge Based Search**
         """)
         
         st.header("💡 Example Requests")
@@ -2057,55 +1928,11 @@ def main():
         - "Need somewhere to stay tonight"  
         - "Feeling really drained"
         - "Can you get me a ride?"
-        
-        **Modern RAG Queries:**
-        - "What qualifications does [person] have?"
-        - "Summarize the main points of the document"
-        - "Find information about [specific topic]"
-        - "What experience does the candidate have?"
-        - "Tell me about the company's background"
-        - "What are the key findings in the report?"
-        
-        **📋 Context-Aware Follow-ups:**
-        - After asking about someone: "What company does he work for?"
-        - "What about his education?"
-        - "What other skills does she have?"
-        - "Tell me more about their experience"
         """)
         
         # Show context status
         if st.session_state.get('last_successful_category') == "Search Knowledge Base":
             st.info("🔗 **Context Active**: Follow-up questions will search documents")
-        
-        st.header("🚀 Modern RAG Techniques")
-        modern_features = """
-        **🎯 LATEST RAG TECHNIQUES:**
-        - **Token-based chunking** with tiktoken for proper token counting
-        - **Recursive text splitting** (LangChain-style) with multiple separators
-        - **Parent-child chunks** for hierarchical context
-        - **Sentence window retrieval** for better context boundaries
-        - **HyDE** (Hypothetical Document Embeddings) for query enhancement
-        - **Query expansion** with LLM for better matching
-        - **MMR** (Maximal Marginal Relevance) for diverse results
-        - **Normalized embeddings** with cosine similarity
-        
-        **🔍 ADVANCED SEARCH:**
-        - **Hybrid retrieval**: Optimized Vector + BM25 search
-        - **Query enhancement** pipeline with multiple techniques
-        - **Context-aware results** with sentence windows
-        - **Parent context** retrieval for comprehensive answers
-        - **Quality-weighted scoring** and ranking
-        - **GPU acceleration** when available
-        
-        **📊 MODERN ARCHITECTURE:**
-        - **Optimized FAISS indices** with proper metrics
-        - **Batch embedding** creation for efficiency
-        - **Smart chunk validation** and filtering
-        - **Comprehensive metadata** extraction
-        - **Advanced tokenization** with tiktoken
-        """
-        
-        st.markdown(modern_features)
         
         # Show modern RAG status
         if VECTOR_STORE_AVAILABLE and "modern_rag_manager" in st.session_state:
@@ -2130,61 +1957,11 @@ def main():
                     if system_info.get("use_bm25"):
                         techniques.append("BM25")
                         
-                    st.success(f"🚀 Modern RAG Ready: {len(sources)} documents, {len(metadata)} chunks, {len(parent_metadata)} parents, {total_tokens:,} tokens ({'+'.join(techniques)})")
-                    
                     if st.session_state.get('last_successful_category') == "Search Knowledge Base":
                         st.info("🔗 Context Active: Next questions will search documents")
                 else:
                     st.info("🚀 Modern RAG: Not created yet")
-        
-        st.markdown("---")
-        st.header("🔧 Installation & Setup")
-        st.markdown("""
-        **For Modern RAG (Required):**
-        ```bash
-        pip install faiss-cpu PyPDF2 rank-bm25 tiktoken
-        ```
-        
-        **For GPU acceleration:**
-        ```bash
-        pip install faiss-gpu PyPDF2 rank-bm25 tiktoken
-        ```
-        
-        **Environment Variables:**
-        ```bash
-        ENDPOINT_URL=https://your-resource.openai.azure.com
-        AZURE_OPENAI_API_KEY=your-api-key
-        DEPLOYMENT_NAME=your-deployment-name
-        API_VERSION=2024-12-01-preview
-        ```
-        
-        **🚀 MODERN RAG ADVANTAGES:**
-        - ✅ **Token-based chunking** with proper token counting
-        - ✅ **HyDE** for enhanced query understanding
-        - ✅ **Query expansion** with LLM assistance
-        - ✅ **MMR** for diverse, non-redundant results
-        - ✅ **Sentence windows** for better context boundaries
-        - ✅ **Parent-child chunks** for comprehensive answers
-        - ✅ **Hybrid search** combining vector and keyword search
-        - ✅ **Normalized embeddings** with cosine similarity
-        - ✅ **Perfect for complex document analysis**
-        """)
-        
-        # Show current status
-        if VECTOR_STORE_AVAILABLE:
-            gpu_status = "🚀 GPU" if GPU_AVAILABLE else "💻 CPU"
-            bm25_status = "🔍 BM25" if BM25_AVAILABLE else "❌ BM25"
-            try:
-                import tiktoken
-                tiktoken_status = "🔢 tiktoken"
-            except:
-                tiktoken_status = "❌ tiktoken"
-            st.markdown(f"**Status:** {gpu_status} | {bm25_status} | {tiktoken_status}")
-            
-        if "openai_client" in st.session_state and "modern_rag_manager" in st.session_state:
-            st.markdown("**🚀 Modern RAG:** Full system ready")
-        else:
-            st.markdown("**❌ Configuration issue**")
+    
         
         if st.button("🗑️ Clear Chat History"):
             # Clear all session state except managers
