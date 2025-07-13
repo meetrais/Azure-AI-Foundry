@@ -10,19 +10,21 @@ from semantic_kernel.functions.kernel_function_decorator import kernel_function
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import pickle
 import time
-import base64
 from io import BytesIO
 import json
 import re
+import math
+from collections import Counter, defaultdict
 
-# Try to import optional dependencies for vector store
+# Try to import dependencies for modern RAG
 try:
     import faiss
     import numpy as np
     import PyPDF2
+    import tiktoken
     VECTOR_STORE_AVAILABLE = True
     
     # Check for GPU support
@@ -31,35 +33,24 @@ try:
     except:
         GPU_AVAILABLE = False
         
-    # Try to import advanced RAG dependencies
+    # Try to import BM25 for hybrid search
     try:
         from rank_bm25 import BM25Okapi
-        import re
-        from collections import Counter
         BM25_AVAILABLE = True
     except ImportError:
         BM25_AVAILABLE = False
-        
-    # Try to import multimodal dependencies
-    try:
-        import fitz  # PyMuPDF for image extraction
-        from PIL import Image
-        MULTIMODAL_AVAILABLE = True
-    except ImportError:
-        MULTIMODAL_AVAILABLE = False
         
 except ImportError:
     VECTOR_STORE_AVAILABLE = False
     GPU_AVAILABLE = False
     BM25_AVAILABLE = False
-    MULTIMODAL_AVAILABLE = False
 
-class TrueMultimodalRAGManager:
-    """True Multimodal RAG with embedded image storage and multimodal embeddings."""
+class ModernRAGManager:
+    """Modern RAG system with latest recommended techniques."""
     
     def __init__(self, openai_client, model_name, data_folder="data", vector_store_path="vector_store"):
         if not VECTOR_STORE_AVAILABLE:
-            raise ImportError("Vector store dependencies not available. Install with: pip install faiss-cpu PyPDF2 rank-bm25")
+            raise ImportError("Vector store dependencies not available. Install with: pip install faiss-cpu PyPDF2 rank-bm25 tiktoken")
         
         self.openai_client = openai_client
         self.model_name = model_name
@@ -70,23 +61,43 @@ class TrueMultimodalRAGManager:
         self.vector_store_path.mkdir(exist_ok=True)
         self.data_folder.mkdir(exist_ok=True)
         
-        # Advanced settings
+        # Modern RAG settings
         self.use_gpu = GPU_AVAILABLE
         self.use_bm25 = BM25_AVAILABLE
-        self.use_multimodal = MULTIMODAL_AVAILABLE
-        self.text_embedding_model = "text-embedding-3-large"  # Best model for multimodal
-        self.chunk_size = 1000
-        self.chunk_overlap = 200
-        self.max_chunks_per_file = 50
-        self.min_image_size = (100, 100)
-        self.max_images_per_pdf = 20
-        self.max_image_size_kb = 500  # Limit image size in embeddings
+        self.text_embedding_model = "text-embedding-3-large"
         
-        # Initialize capabilities info
+        # Token-based chunking (modern approach)
+        self.encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
+        self.chunk_size = 512  # tokens (optimal for most models)
+        self.chunk_overlap = 64  # tokens overlap
+        self.max_tokens_per_chunk = 8000  # embedding model limit
+        
+        # Advanced retrieval settings
+        self.sentence_window_size = 3  # for sentence window retrieval
+        self.parent_chunk_size = 2048  # larger parent chunks
+        self.use_hyde = True  # Hypothetical Document Embeddings
+        self.use_query_expansion = True
+        self.use_mmr = True  # Maximal Marginal Relevance
+        self.mmr_diversity_score = 0.3
+        
+        # Quality settings
+        self.min_chunk_tokens = 32
+        self.max_chunks_per_file = 150
+        
+        self._initialize_tokenizer()
         self._show_capabilities()
     
+    def _initialize_tokenizer(self):
+        """Initialize tokenizer for proper token counting."""
+        try:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            st.info("✅ Initialized tiktoken tokenizer for GPT-4")
+        except Exception as e:
+            st.warning(f"⚠️ Tokenizer initialization failed: {e}")
+            self.tokenizer = None
+    
     def _show_capabilities(self):
-        """Show system capabilities."""
+        """Show modern RAG capabilities."""
         if self.use_gpu:
             st.info(f"🚀 GPU acceleration enabled! Found {faiss.get_num_gpus()} GPU(s)")
         
@@ -94,448 +105,745 @@ class TrueMultimodalRAGManager:
             st.info("🔍 Hybrid retrieval available (Vector + BM25)")
         else:
             st.warning("⚠️ BM25 not available. Install: pip install rank-bm25")
-            
-        if self.use_multimodal:
-            st.info("🖼️ True multimodal support enabled (Images stored in embeddings)")
+        
+        techniques = []
+        if self.use_hyde:
+            techniques.append("HyDE")
+        if self.use_query_expansion:
+            techniques.append("Query Expansion")
+        if self.use_mmr:
+            techniques.append("MMR")
+        
+        st.info(f"✨ Modern RAG techniques: {', '.join(techniques)}, Token-based chunking, Sentence Window")
+    
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in text using tiktoken."""
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text))
         else:
-            st.warning("⚠️ Multimodal not available. Install: pip install PyMuPDF Pillow")
+            # Fallback estimation (rough)
+            return len(text.split()) * 1.3
     
-    def extract_and_encode_images_from_pdf(self, pdf_path: Path) -> List[Dict]:
-        """Extract images from PDF and encode them as base64 for embedding storage."""
-        if not self.use_multimodal:
-            return []
+    def recursive_character_text_splitter(self, text: str, separators: List[str] = None) -> List[str]:
+        """Modern recursive text splitting approach (LangChain-style)."""
+        if separators is None:
+            separators = ["\n\n", "\n", ". ", " ", ""]
         
-        images_data = []
-        try:
-            st.write(f"🔍 Extracting images from {pdf_path.name}...")
-            pdf_document = fitz.open(str(pdf_path))
-            st.write(f"📄 PDF has {len(pdf_document)} pages")
+        def split_text(text: str, separators: List[str]) -> List[str]:
+            if not separators:
+                return [text]
             
-            for page_num in range(len(pdf_document)):
-                page = pdf_document[page_num]
-                image_list = page.get_images()
-                
-                st.write(f"📄 Page {page_num + 1}: Found {len(image_list)} image references")
-                
-                for img_index, img in enumerate(image_list):
-                    if len(images_data) >= self.max_images_per_pdf:
-                        st.write(f"⚠️ Reached maximum image limit ({self.max_images_per_pdf})")
-                        break
-                        
-                    try:
-                        # Extract image
-                        xref = img[0]
-                        pix = fitz.Pixmap(pdf_document, xref)
-                        
-                        # Skip if image is too small
-                        if pix.width < self.min_image_size[0] or pix.height < self.min_image_size[1]:
-                            st.write(f"⏭️ Skipping small image: {pix.width}x{pix.height}")
-                            pix = None
-                            continue
-                        
-                        # Handle different color spaces and convert to RGB
-                        if pix.n - pix.alpha < 4:  # GRAY or RGB
-                            if pix.n != 4:  # Not RGBA
-                                pix = fitz.Pixmap(fitz.csRGB, pix)
-                            
-                            # Convert to bytes
-                            img_data = pix.tobytes("png")
-                            
-                            # Check size limit
-                            size_kb = len(img_data) / 1024
-                            if size_kb > self.max_image_size_kb:
-                                # Resize image if too large
-                                img_pil = Image.open(BytesIO(img_data))
-                                # Calculate new size maintaining aspect ratio
-                                ratio = min(800/img_pil.width, 600/img_pil.height)
-                                new_size = (int(img_pil.width * ratio), int(img_pil.height * ratio))
-                                img_pil = img_pil.resize(new_size, Image.Resampling.LANCZOS)
-                                
-                                # Convert back to bytes
-                                buffer = BytesIO()
-                                img_pil.save(buffer, format='PNG', optimize=True)
-                                img_data = buffer.getvalue()
-                                size_kb = len(img_data) / 1024
-                            
-                            # Encode to base64 for storage
-                            base64_image = base64.b64encode(img_data).decode('utf-8')
-                            
-                            # Analyze image content with vision model
-                            image_description = self.analyze_image_with_vision(base64_image)
-                            
-                            # Create image metadata with embedded data
-                            image_info = {
-                                "base64_data": base64_image,
-                                "description": image_description,
-                                "source_pdf": pdf_path.name,
-                                "page_number": page_num + 1,
-                                "image_index": img_index + 1,
-                                "width": pix.width,
-                                "height": pix.height,
-                                "size_kb": size_kb,
-                                "format": "PNG"
-                            }
-                            
-                            images_data.append(image_info)
-                            st.write(f"✅ Processed image: Page {page_num+1} Image {img_index+1} ({size_kb:.1f}KB)")
-                            
-                        pix = None  # Clean up
-                        
-                    except Exception as img_error:
-                        st.write(f"❌ Error processing image {img_index + 1}: {str(img_error)}")
-                        continue
-                
-                if len(images_data) >= self.max_images_per_pdf:
-                    break
+            separator = separators[0]
+            if separator == "":
+                # Character-level splitting
+                return list(text)
             
-            pdf_document.close()
-            st.success(f"✅ Extracted and encoded {len(images_data)} images from {pdf_path.name}")
+            splits = text.split(separator)
+            if len(splits) == 1:
+                # Separator not found, try next separator
+                return split_text(text, separators[1:])
             
-        except Exception as e:
-            st.error(f"❌ Error extracting images from {pdf_path.name}: {str(e)}")
+            # Process splits recursively
+            final_splits = []
+            for split in splits:
+                if self.count_tokens(split) <= self.chunk_size:
+                    final_splits.append(split)
+                else:
+                    # Split is still too large, recursively split further
+                    sub_splits = split_text(split, separators[1:])
+                    final_splits.extend(sub_splits)
+            
+            return final_splits
         
-        return images_data
+        return split_text(text, separators)
     
-    def analyze_image_with_vision(self, base64_image: str) -> str:
-        """Analyze image content using vision model."""
-        try:
-            # Check if the model supports vision
-            if "gpt-4" not in self.model_name.lower():
-                return ""
-            
-            # Call vision model
-            response = self.openai_client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Describe this image in detail, focusing on text content, charts, diagrams, people, objects, and any important visual information that would be useful for document search and retrieval."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{base64_image}",
-                                    "detail": "high"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=300,
-                temperature=0.1
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except Exception as e:
-            st.write(f"⚠️ Vision analysis failed: {str(e)}")
-            return ""
-    
-    def create_multimodal_embedding(self, text: str, images: List[Dict] = None) -> np.ndarray:
-        """Create true multimodal embedding combining text and image information."""
-        try:
-            # Enhanced text with image descriptions
-            enhanced_text = text
-            
-            # Add image descriptions to text
-            if images:
-                image_descriptions = []
-                for img in images:
-                    desc = img.get("description", "")
-                    if desc:
-                        image_descriptions.append(f"[Image: {desc}]")
-                
-                if image_descriptions:
-                    enhanced_text += "\n\nImage Content:\n" + "\n".join(image_descriptions)
-            
-            # Get embedding for enhanced text
-            response = self.openai_client.embeddings.create(
-                model=self.text_embedding_model,
-                input=enhanced_text[:8000]  # Truncate if too long
-            )
-            
-            embedding = np.array(response.data[0].embedding, dtype=np.float32)
-            
-            return embedding
-            
-        except Exception as e:
-            st.error(f"Error creating multimodal embedding: {str(e)}")
-            # Return zero vector as fallback
-            return np.zeros(3072, dtype=np.float32)  # text-embedding-3-large dimension
-    
-    def intelligent_text_preprocessing(self, text: str) -> Dict:
-        """Advanced text preprocessing with structure awareness."""
-        if not text.strip():
-            return {"sections": [], "metadata": {}}
+    def create_chunks_with_overlap(self, text: str) -> List[Dict]:
+        """Create chunks with token-based overlap (modern approach)."""
+        # First, split into sections by double newlines
+        sections = text.split('\n\n')
+        all_chunks = []
         
-        # Clean and normalize text
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        
-        # Extract structure markers
-        sections = []
-        current_section = {"title": "", "content": "", "type": "content"}
-        
-        lines = text.split('\n')
-        for line in lines:
-            line = line.strip()
-            if not line:
+        for section_idx, section in enumerate(sections):
+            section = section.strip()
+            if not section:
                 continue
+            
+            # Use recursive splitting for this section
+            splits = self.recursive_character_text_splitter(section)
+            
+            # Combine splits into properly sized chunks with overlap
+            current_chunk = ""
+            current_tokens = 0
+            
+            for split in splits:
+                split = split.strip()
+                if not split:
+                    continue
                 
-            # Detect headers/sections
-            if (len(line) < 100 and 
-                (line.isupper() or 
-                 re.match(r'^[A-Z][a-z\s]+:?\s*$', line) or
-                 re.match(r'^\d+\.\s+[A-Z]', line) or
-                 line.endswith(':'))):
+                split_tokens = self.count_tokens(split)
                 
-                # Save previous section
-                if current_section["content"]:
-                    sections.append(current_section.copy())
-                
-                # Start new section
-                current_section = {
-                    "title": line,
-                    "content": "",
-                    "type": "header" if line.isupper() else "section"
-                }
-            else:
-                current_section["content"] += " " + line
+                # Check if adding this split would exceed chunk size
+                if current_tokens + split_tokens > self.chunk_size and current_chunk:
+                    # Save current chunk
+                    if current_tokens >= self.min_chunk_tokens:
+                        chunk_dict = self._create_chunk_dict(current_chunk, section_idx)
+                        all_chunks.append(chunk_dict)
+                    
+                    # Start new chunk with overlap
+                    overlap_text = self._get_overlap_text(current_chunk)
+                    current_chunk = overlap_text + " " + split if overlap_text else split
+                    current_tokens = self.count_tokens(current_chunk)
+                else:
+                    # Add to current chunk
+                    current_chunk = current_chunk + " " + split if current_chunk else split
+                    current_tokens = self.count_tokens(current_chunk)
+            
+            # Add final chunk
+            if current_chunk.strip() and current_tokens >= self.min_chunk_tokens:
+                chunk_dict = self._create_chunk_dict(current_chunk, section_idx)
+                all_chunks.append(chunk_dict)
         
-        # Add final section
-        if current_section["content"]:
-            sections.append(current_section)
+        return all_chunks
+    
+    def _get_overlap_text(self, text: str) -> str:
+        """Get overlap text for chunk continuity."""
+        tokens = self.count_tokens(text)
+        if tokens <= self.chunk_overlap:
+            return text
+        
+        # Take last portion for overlap
+        words = text.split()
+        overlap_words = []
+        overlap_tokens = 0
+        
+        for word in reversed(words):
+            word_tokens = self.count_tokens(word)
+            if overlap_tokens + word_tokens <= self.chunk_overlap:
+                overlap_words.insert(0, word)
+                overlap_tokens += word_tokens
+            else:
+                break
+        
+        return " ".join(overlap_words)
+    
+    def _create_chunk_dict(self, content: str, section_idx: int) -> Dict:
+        """Create standardized chunk dictionary."""
+        return {
+            "content": content.strip(),
+            "tokens": self.count_tokens(content),
+            "char_count": len(content),
+            "section_idx": section_idx,
+            "chunk_type": "regular"
+        }
+    
+    def create_parent_child_chunks(self, text: str) -> Tuple[List[Dict], List[Dict]]:
+        """Create parent-child chunk hierarchy for better retrieval."""
+        # Create large parent chunks
+        parent_chunks = []
+        words = text.split()
+        
+        current_parent = ""
+        current_tokens = 0
+        parent_idx = 0
+        
+        for word in words:
+            word_tokens = self.count_tokens(word)
+            
+            if current_tokens + word_tokens > self.parent_chunk_size and current_parent:
+                # Save parent chunk
+                parent_chunks.append({
+                    "content": current_parent.strip(),
+                    "tokens": current_tokens,
+                    "parent_id": parent_idx,
+                    "chunk_type": "parent"
+                })
+                parent_idx += 1
+                current_parent = word
+                current_tokens = word_tokens
+            else:
+                current_parent += " " + word if current_parent else word
+                current_tokens += word_tokens
+        
+        # Add final parent
+        if current_parent.strip():
+            parent_chunks.append({
+                "content": current_parent.strip(),
+                "tokens": current_tokens,
+                "parent_id": parent_idx,
+                "chunk_type": "parent"
+            })
+        
+        # Create child chunks from each parent
+        child_chunks = []
+        child_id = 0
+        
+        for parent in parent_chunks:
+            children = self.create_chunks_with_overlap(parent["content"])
+            for child in children:
+                child["parent_id"] = parent["parent_id"]
+                child["child_id"] = child_id
+                child["chunk_type"] = "child"
+                child_chunks.append(child)
+                child_id += 1
+        
+        return parent_chunks, child_chunks
+    
+    def create_sentence_windows(self, chunks: List[Dict], full_text: str) -> List[Dict]:
+        """Create sentence windows for better context retrieval."""
+        # Split full text into sentences (simple approach)
+        sentences = re.split(r'(?<=[.!?])\s+', full_text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        # Map chunks to sentence positions
+        enhanced_chunks = []
+        
+        for chunk in chunks:
+            chunk_content = chunk["content"]
+            
+            # Find sentences that overlap with this chunk
+            chunk_sentences = []
+            for i, sentence in enumerate(sentences):
+                if sentence in chunk_content or chunk_content in sentence:
+                    chunk_sentences.append((i, sentence))
+            
+            if chunk_sentences:
+                # Get sentence window around the chunk
+                center_idx = chunk_sentences[len(chunk_sentences)//2][0]
+                start_idx = max(0, center_idx - self.sentence_window_size)
+                end_idx = min(len(sentences), center_idx + self.sentence_window_size + 1)
+                
+                window_sentences = sentences[start_idx:end_idx]
+                window_content = " ".join(window_sentences)
+                
+                # Create enhanced chunk
+                enhanced_chunk = chunk.copy()
+                enhanced_chunk["window_content"] = window_content
+                enhanced_chunk["window_tokens"] = self.count_tokens(window_content)
+                enhanced_chunk["sentence_range"] = (start_idx, end_idx)
+                enhanced_chunks.append(enhanced_chunk)
+            else:
+                # Keep original chunk if no sentence mapping found
+                enhanced_chunks.append(chunk)
+        
+        return enhanced_chunks
+    
+    def extract_and_process_text(self, pdf_path: Path) -> Dict:
+        """Extract and process text with modern techniques."""
+        # Extract text
+        text = self.extract_text_from_pdf(pdf_path)
+        if not text:
+            return {"success": False, "message": f"No text extracted from {pdf_path.name}"}
+        
+        # Clean and preprocess
+        text = self._clean_text(text)
         
         # Extract metadata
         metadata = self._extract_metadata(text)
         
-        return {"sections": sections, "metadata": metadata}
+        # Create parent-child chunks
+        parent_chunks, child_chunks = self.create_parent_child_chunks(text)
+        
+        # Add sentence windows to child chunks
+        enhanced_chunks = self.create_sentence_windows(child_chunks, text)
+        
+        # Add source information
+        for chunk in enhanced_chunks:
+            chunk["source"] = pdf_path.name
+        
+        for chunk in parent_chunks:
+            chunk["source"] = pdf_path.name
+        
+        return {
+            "success": True,
+            "text": text,
+            "metadata": metadata,
+            "parent_chunks": parent_chunks,
+            "child_chunks": enhanced_chunks,
+            "total_tokens": self.count_tokens(text)
+        }
+    
+    def _clean_text(self, text: str) -> str:
+        """Clean text for better processing with improved section handling."""
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Fix common PDF extraction issues
+        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+        text = re.sub(r'(\d+)([A-Za-z])', r'\1 \2', text)
+        text = re.sub(r'([A-Za-z])(\d+)', r'\1 \2', text)
+        
+        # Fix sentence boundaries
+        text = re.sub(r'\.([A-Z])', r'. \1', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Clean up common document structure artifacts
+        # Remove standalone section markers that might confuse processing
+        text = re.sub(r'\b(Appendix|Index|Bibliography|References|Summary|Abstract|Introduction|Overview)\s*:\s*(?=\w)', 
+                     r'\1 - ', text, flags=re.IGNORECASE)
+        
+        # Fix numbered lists that might get confused with section headers
+        text = re.sub(r'^\s*(\d+)\.\s*([A-Z][a-z]+)\s*:\s*', r'\1. \2: ', text, flags=re.MULTILINE)
+        
+        # Remove page numbers and headers/footers that might interfere
+        text = re.sub(r'\n\s*\d+\s*\n', '\n', text)  # Remove standalone page numbers
+        text = re.sub(r'\n\s*Page\s+\d+\s*\n', '\n', text, flags=re.IGNORECASE)
+        
+        return text.strip()
     
     def _extract_metadata(self, text: str) -> Dict:
-        """Extract key metadata from text."""
+        """Extract metadata using modern patterns."""
         metadata = {}
         
-        # Extract emails
+        # Basic statistics
+        metadata["char_count"] = len(text)
+        metadata["word_count"] = len(text.split())
+        metadata["token_count"] = self.count_tokens(text)
+        
+        # Extract patterns
         emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
         if emails:
-            metadata["emails"] = emails
+            metadata["emails"] = list(set(emails[:10]))
+        
+        # Extract URLs
+        urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text)
+        if urls:
+            metadata["urls"] = list(set(urls[:5]))
         
         # Extract phone numbers
-        phones = re.findall(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', text)
+        phones = re.findall(r'\b(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b', text)
         if phones:
-            metadata["phones"] = phones
+            metadata["phone_numbers"] = list(set(phones[:5]))
         
-        # Extract years of experience
-        experience = re.findall(r'(\d+)\s+years?\s+of\s+experience', text, re.IGNORECASE)
-        if experience:
-            metadata["experience_years"] = experience
+        # Extract dates
+        dates = re.findall(r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b', text, re.IGNORECASE)
+        if dates:
+            metadata["dates"] = list(set(dates[:10]))
         
-        # Extract education keywords
-        education_keywords = ['university', 'college', 'degree', 'bachelor', 'master', 'phd', 'diploma']
-        found_education = [word for word in education_keywords if word in text.lower()]
-        if found_education:
-            metadata["education_terms"] = found_education
+        # Extract entities (capitalized terms)
+        entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+        if entities:
+            common_words = {'The', 'This', 'That', 'They', 'These', 'Those', 'And', 'But', 'Or', 'For', 'In', 'On', 'At', 'To', 'From', 'With', 'By', 'Of', 'As', 'Is', 'Was', 'Are', 'Were', 'Be', 'Been', 'Being'}
+            unique_entities = [e for e in set(entities) if e not in common_words and len(e) > 2]
+            if unique_entities:
+                metadata["entities"] = sorted(unique_entities[:25])
         
-        # Extract technology keywords
-        tech_keywords = ['python', 'java', 'javascript', 'react', 'node', 'sql', 'aws', 'azure', 'docker', 'kubernetes']
-        found_tech = [word for word in tech_keywords if word.lower() in text.lower()]
-        if found_tech:
-            metadata["technologies"] = found_tech
+        # Extract keywords using frequency analysis
+        keywords = self._extract_keywords(text)
+        if keywords:
+            metadata["keywords"] = keywords
+        
+        # Detect content type
+        metadata["content_type"] = self._detect_content_type(text)
         
         return metadata
     
-    def intelligent_chunking_with_embedded_images(self, sections: List[Dict], images_data: List[Dict], 
-                                                 chunk_size: int = 1000, overlap: int = 200) -> List[Dict]:
-        """Intelligent chunking with embedded image data."""
-        chunks = []
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extract keywords using TF-IDF-like approach."""
+        # Simple keyword extraction
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
         
-        # Create text chunks first
-        text_chunks = self.intelligent_chunking(sections, chunk_size, overlap)
-        
-        # Distribute images across chunks intelligently
-        for chunk_idx, chunk in enumerate(text_chunks):
-            chunk["embedded_images"] = []
-            chunk["has_images"] = False
-            
-            # Distribute images across chunks based on content relevance
-            if images_data:
-                # Simple distribution: spread images across chunks
-                total_chunks = len(text_chunks)
-                if total_chunks > 0:
-                    images_per_chunk = max(1, len(images_data) // total_chunks)
-                    start_idx = chunk_idx * images_per_chunk
-                    end_idx = min(start_idx + images_per_chunk + 1, len(images_data))
-                    
-                    # Assign images to this chunk
-                    assigned_images = images_data[start_idx:end_idx]
-                    
-                    # Store only essential image data with the chunk
-                    for img in assigned_images:
-                        chunk_image = {
-                            "base64_data": img["base64_data"],
-                            "description": img["description"],
-                            "source_pdf": img["source_pdf"],
-                            "page_number": img["page_number"],
-                            "width": img["width"],
-                            "height": img["height"],
-                            "size_kb": img["size_kb"]
-                        }
-                        chunk["embedded_images"].append(chunk_image)
-                    
-                    chunk["has_images"] = len(chunk["embedded_images"]) > 0
-            
-            chunks.append(chunk)
-        
-        return chunks
-    
-    def intelligent_chunking(self, sections: List[Dict], chunk_size: int = 1000, overlap: int = 200) -> List[Dict]:
-        """Intelligent chunking with context preservation."""
-        chunks = []
-        
-        for section in sections:
-            title = section.get("title", "")
-            content = section.get("content", "")
-            section_type = section.get("type", "content")
-            
-            if not content.strip():
-                continue
-            
-            # For small sections, keep whole
-            if len(content) <= chunk_size:
-                chunks.append({
-                    "content": f"{title}\n{content}".strip(),
-                    "title": title,
-                    "type": section_type,
-                    "tokens": self._estimate_tokens(content)
-                })
-                continue
-            
-            # Split large sections intelligently
-            sentences = re.split(r'(?<=[.!?])\s+', content)
-            current_chunk = title + "\n" if title else ""
-            current_size = len(current_chunk)
-            
-            for sentence in sentences:
-                sentence = sentence.strip()
-                if not sentence:
-                    continue
-                
-                # Check if adding sentence exceeds chunk size
-                if current_size + len(sentence) > chunk_size and current_chunk.strip():
-                    # Save current chunk
-                    chunks.append({
-                        "content": current_chunk.strip(),
-                        "title": title,
-                        "type": section_type,
-                        "tokens": self._estimate_tokens(current_chunk)
-                    })
-                    
-                    # Start new chunk with overlap
-                    overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-                    current_chunk = f"{title}\n{overlap_text}" if title else overlap_text
-                    current_size = len(current_chunk)
-                
-                current_chunk += " " + sentence
-                current_size += len(sentence) + 1
-            
-            # Add final chunk
-            if current_chunk.strip():
-                chunks.append({
-                    "content": current_chunk.strip(),
-                    "title": title,
-                    "type": section_type,
-                    "tokens": self._estimate_tokens(current_chunk)
-                })
-        
-        return chunks
-    
-    def _estimate_tokens(self, text: str) -> int:
-        """Rough token estimation."""
-        return len(text.split()) * 1.3
-    
-    def create_multimodal_search_index(self, chunks: List[Dict]) -> Dict:
-        """Create search index with embedded multimodal data."""
-        if not chunks:
-            return {"vector_index": None, "bm25_index": None, "metadata": []}
-        
-        # Prepare metadata with embedded images
-        metadata = []
-        for i, chunk in enumerate(chunks):
-            chunk_metadata = {
-                "content": chunk["content"],
-                "title": chunk.get("title", ""),
-                "type": chunk.get("type", "content"),
-                "tokens": chunk.get("tokens", 0),
-                "chunk_id": i,
-                "embedded_images": chunk.get("embedded_images", []),
-                "has_images": chunk.get("has_images", False),
-                "source": chunk.get("source", ""),
-                "file_metadata": chunk.get("file_metadata", {}),
-                "file_index": chunk.get("file_index", 0)
-            }
-            metadata.append(chunk_metadata)
-        
-        # Create multimodal embeddings
-        st.info("🔄 Creating true multimodal embeddings...")
-        embeddings = self.get_optimized_multimodal_embeddings(chunks)
-        vector_index = self.create_faiss_index(embeddings)
-        
-        # Create BM25 index
-        bm25_index = None
-        tokenized_docs = None
-        if self.use_bm25:
-            st.info("🔄 Creating BM25 sparse index...")
-            texts = [chunk["content"] for chunk in chunks]
-            tokenized_docs = [self._tokenize_for_bm25(text) for text in texts]
-            bm25_index = BM25Okapi(tokenized_docs)
-        
-        return {
-            "vector_index": vector_index,
-            "bm25_index": bm25_index,
-            "metadata": metadata,
-            "tokenized_docs": tokenized_docs if self.use_bm25 else None
+        # Common stop words to filter
+        stop_words = {
+            'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'as',
+            'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those',
+            'a', 'an', 'the', 'you', 'your', 'they', 'their', 'we', 'our', 'he', 'his', 'she', 'her',
+            'it', 'its', 'me', 'my', 'us', 'him', 'them', 'all', 'any', 'some', 'each', 'every',
+            'other', 'such', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just', 'now'
         }
+        
+        # Filter and count
+        filtered_words = [w for w in words if w not in stop_words and len(w) > 3]
+        word_freq = Counter(filtered_words)
+        
+        # Return top keywords
+        return [word for word, freq in word_freq.most_common(20) if freq > 1]
     
-    def get_optimized_multimodal_embeddings(self, chunks: List[Dict], batch_size: int = 10) -> np.ndarray:
-        """Create optimized multimodal embeddings with true image integration."""
+    def _detect_content_type(self, text: str) -> str:
+        """Detect document content type."""
+        text_lower = text.lower()
+        
+        patterns = {
+            "resume": ["resume", "cv", "curriculum vitae", "experience", "education", "skills", "employment", "work history"],
+            "legal": ["contract", "agreement", "terms", "conditions", "legal", "whereas", "party", "jurisdiction"],
+            "financial": ["financial", "revenue", "profit", "budget", "expense", "investment", "earnings", "fiscal"],
+            "technical": ["technical", "specification", "manual", "guide", "documentation", "api", "system", "software"],
+            "report": ["report", "analysis", "summary", "findings", "conclusion", "executive summary", "overview"],
+            "academic": ["research", "study", "paper", "journal", "university", "professor", "thesis", "dissertation"],
+            "medical": ["medical", "health", "patient", "diagnosis", "treatment", "clinical", "hospital", "doctor"]
+        }
+        
+        scores = {}
+        for doc_type, keywords in patterns.items():
+            score = sum(1 for keyword in keywords if keyword in text_lower)
+            if score > 0:
+                scores[doc_type] = score
+        
+        if scores:
+            return max(scores, key=scores.get)
+        return "general"
+    
+    def create_embeddings_batch(self, texts: List[str], batch_size: int = 20) -> np.ndarray:
+        """Create embeddings in batches with proper token handling."""
         embeddings = []
         
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
             
             try:
-                batch_embeddings = []
+                # Truncate texts to fit embedding model limits
+                truncated_batch = []
+                for text in batch:
+                    if self.count_tokens(text) > self.max_tokens_per_chunk:
+                        # Truncate to fit
+                        words = text.split()
+                        truncated_text = ""
+                        tokens = 0
+                        
+                        for word in words:
+                            word_tokens = self.count_tokens(word)
+                            if tokens + word_tokens <= self.max_tokens_per_chunk - 10:  # Safety margin
+                                truncated_text += " " + word if truncated_text else word
+                                tokens += word_tokens
+                            else:
+                                break
+                        
+                        truncated_batch.append(truncated_text)
+                    else:
+                        truncated_batch.append(text)
                 
-                for chunk in batch:
-                    text = chunk["content"]
-                    embedded_images = chunk.get("embedded_images", [])
-                    
-                    # Create multimodal embedding
-                    embedding = self.create_multimodal_embedding(text, embedded_images)
-                    batch_embeddings.append(embedding)
+                # Create embeddings
+                response = self.openai_client.embeddings.create(
+                    model=self.text_embedding_model,
+                    input=truncated_batch
+                )
                 
+                batch_embeddings = [np.array(data.embedding, dtype=np.float32) for data in response.data]
                 embeddings.extend(batch_embeddings)
                 
                 # Progress update
-                progress = min(i + batch_size, len(chunks))
-                if progress % 5 == 0:
-                    st.write(f"✅ Processed {progress}/{len(chunks)} multimodal embeddings")
+                progress = min(i + batch_size, len(texts))
+                if progress % 100 == 0 or progress == len(texts):
+                    st.write(f"✅ Created embeddings for {progress}/{len(texts)} chunks")
                 
             except Exception as e:
-                st.warning(f"Error in batch {i//batch_size + 1}: {str(e)}")
+                st.warning(f"Error creating embeddings for batch {i//batch_size + 1}: {str(e)}")
                 # Add zero vectors for failed batch
                 for _ in batch:
                     embeddings.append(np.zeros(3072, dtype=np.float32))
         
         return np.array(embeddings, dtype=np.float32)
     
-    def _tokenize_for_bm25(self, text: str) -> List[str]:
-        """Tokenize text for BM25."""
-        text = re.sub(r'[^\w\s]', ' ', text.lower())
-        return text.split()
+    def hyde_query_expansion(self, query: str) -> str:
+        """HyDE: Generate hypothetical document for better retrieval."""
+        if not self.use_hyde:
+            return query
+        
+        try:
+            hyde_prompt = f"""Write a detailed, informative paragraph that would answer this question: "{query}"
+            
+Write as if you're providing the actual answer from a document. Be specific and include relevant details, terminology, and context that would typically appear in documents about this topic.
+
+Hypothetical answer:"""
+            
+            response = self.openai_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": hyde_prompt}],
+                temperature=0.3,
+                max_tokens=200
+            )
+            
+            hypothetical_doc = response.choices[0].message.content.strip()
+            
+            # Combine original query with hypothetical document
+            expanded_query = f"{query} {hypothetical_doc}"
+            return expanded_query
+            
+        except Exception as e:
+            st.warning(f"HyDE generation failed: {e}")
+            return query
+    
+    def expand_query(self, query: str) -> str:
+        """Expand query with related terms."""
+        if not self.use_query_expansion:
+            return query
+        
+        try:
+            expansion_prompt = f"""Given this search query: "{query}"
+
+Generate 3-5 related terms, synonyms, or phrases that would help find relevant documents. Focus on:
+- Alternative terminology
+- Related concepts  
+- Professional/technical terms
+- Common synonyms
+
+Return only the additional terms, separated by spaces:"""
+            
+            response = self.openai_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": expansion_prompt}],
+                temperature=0.3,
+                max_tokens=50
+            )
+            
+            expansion_terms = response.choices[0].message.content.strip()
+            
+            # Combine with original query
+            expanded_query = f"{query} {expansion_terms}"
+            return expanded_query
+            
+        except Exception as e:
+            st.warning(f"Query expansion failed: {e}")
+            return query
+    
+    def maximal_marginal_relevance(self, query_embedding: np.ndarray, 
+                                  embeddings: np.ndarray, 
+                                  metadata: List[Dict], 
+                                  k: int, 
+                                  lambda_param: float = 0.7) -> List[Dict]:
+        """MMR for diverse result selection."""
+        if not self.use_mmr or len(embeddings) == 0:
+            return []
+        
+        # Calculate similarities to query
+        similarities = np.dot(embeddings, query_embedding) / (
+            np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query_embedding)
+        )
+        
+        selected_indices = []
+        remaining_indices = list(range(len(embeddings)))
+        
+        # Select first document (highest similarity)
+        if remaining_indices:
+            best_idx = remaining_indices[np.argmax(similarities[remaining_indices])]
+            selected_indices.append(best_idx)
+            remaining_indices.remove(best_idx)
+        
+        # Select subsequent documents using MMR
+        while len(selected_indices) < k and remaining_indices:
+            mmr_scores = []
+            
+            for idx in remaining_indices:
+                # Relevance score
+                relevance = similarities[idx]
+                
+                # Diversity score (max similarity to already selected)
+                if selected_indices:
+                    selected_embeddings = embeddings[selected_indices]
+                    current_embedding = embeddings[idx]
+                    
+                    diversities = np.dot(selected_embeddings, current_embedding) / (
+                        np.linalg.norm(selected_embeddings, axis=1) * np.linalg.norm(current_embedding)
+                    )
+                    max_similarity = np.max(diversities)
+                else:
+                    max_similarity = 0
+                
+                # MMR score
+                mmr_score = lambda_param * relevance - (1 - lambda_param) * max_similarity
+                mmr_scores.append(mmr_score)
+            
+            # Select document with highest MMR score
+            if mmr_scores:
+                best_mmr_idx = np.argmax(mmr_scores)
+                selected_idx = remaining_indices[best_mmr_idx]
+                selected_indices.append(selected_idx)
+                remaining_indices.remove(selected_idx)
+        
+        # Return selected documents
+        results = []
+        for idx in selected_indices:
+            if idx < len(metadata):
+                result = metadata[idx].copy()
+                result["similarity_score"] = float(similarities[idx])
+                result["mmr_selected"] = True
+                results.append(result)
+        
+        return results
+    
+    def create_vector_store(self) -> Dict:
+        """Create modern vector store with latest techniques."""
+        pdf_files = list(self.data_folder.glob("*.pdf"))
+        
+        if not pdf_files:
+            return {"success": False, "message": "No PDF files found in data folder"}
+        
+        max_files = 25
+        if len(pdf_files) > max_files:
+            st.warning(f"Processing first {max_files} of {len(pdf_files)} files")
+            pdf_files = pdf_files[:max_files]
+        
+        all_child_chunks = []
+        all_parent_chunks = []
+        processing_stats = {"files": 0, "chunks": 0, "tokens": 0}
+        
+        # Progress tracking
+        main_progress = st.progress(0)
+        main_status = st.empty()
+        start_time = time.time()
+        
+        main_status.text("📄 Processing PDFs with modern RAG techniques...")
+        
+        # Process each PDF
+        for file_idx, pdf_file in enumerate(pdf_files):
+            st.write(f"\n### Processing {pdf_file.name}")
+            
+            result = self.extract_and_process_text(pdf_file)
+            
+            if not result["success"]:
+                st.warning(result["message"])
+                continue
+            
+            # Add file metadata
+            for chunk in result["child_chunks"]:
+                chunk["file_index"] = file_idx
+                chunk["document_metadata"] = result["metadata"]
+            
+            for chunk in result["parent_chunks"]:
+                chunk["file_index"] = file_idx
+                chunk["document_metadata"] = result["metadata"]
+            
+            all_child_chunks.extend(result["child_chunks"])
+            all_parent_chunks.extend(result["parent_chunks"])
+            
+            processing_stats["files"] += 1
+            processing_stats["chunks"] += len(result["child_chunks"])
+            processing_stats["tokens"] += result["total_tokens"]
+            
+            st.success(f"✅ Processed {pdf_file.name}: {len(result['child_chunks'])} chunks, {result['total_tokens']} tokens")
+            
+            # Update progress
+            file_progress = (file_idx + 1) / len(pdf_files) * 0.4
+            main_progress.progress(file_progress)
+        
+        if not all_child_chunks:
+            return {"success": False, "message": "No content extracted from any PDF files"}
+        
+        # Limit chunks for performance
+        max_total_chunks = self.max_chunks_per_file * len(pdf_files)
+        if len(all_child_chunks) > max_total_chunks:
+            st.info(f"Limiting to {max_total_chunks} chunks for optimal performance")
+            # Sort by token count (prefer longer, more informative chunks)
+            all_child_chunks.sort(key=lambda x: x.get("tokens", 0), reverse=True)
+            all_child_chunks = all_child_chunks[:max_total_chunks]
+            processing_stats["chunks"] = len(all_child_chunks)
+        
+        main_status.text("🧠 Creating modern embeddings...")
+        main_progress.progress(0.4)
+        
+        # Create embeddings for child chunks (used for retrieval)
+        try:
+            # Prepare texts for embedding (use window content if available)
+            embed_texts = []
+            for chunk in all_child_chunks:
+                text = chunk.get("window_content", chunk["content"])
+                embed_texts.append(text)
+            
+            embeddings = self.create_embeddings_batch(embed_texts)
+            main_progress.progress(0.7)
+        except Exception as e:
+            return {"success": False, "message": f"Error creating embeddings: {str(e)}"}
+        
+        main_status.text("📊 Building modern search indices...")
+        
+        # Create search indices
+        try:
+            indices = self.create_search_indices(embeddings, all_child_chunks, all_parent_chunks)
+            main_progress.progress(0.9)
+        except Exception as e:
+            return {"success": False, "message": f"Error creating indices: {str(e)}"}
+        
+        main_status.text("💾 Saving modern vector store...")
+        
+        # Save to disk
+        try:
+            self.save_indices(indices)
+        except Exception as e:
+            return {"success": False, "message": f"Error saving: {str(e)}"}
+        
+        # Complete
+        total_time = time.time() - start_time
+        main_progress.progress(1.0)
+        main_status.text(f"✅ Modern RAG system created in {total_time:.1f}s!")
+        
+        techniques = ["Token-based Chunking", "Sentence Windows", "Parent-Child"]
+        if self.use_hyde:
+            techniques.append("HyDE")
+        if self.use_query_expansion:
+            techniques.append("Query Expansion") 
+        if self.use_mmr:
+            techniques.append("MMR")
+        if self.use_bm25:
+            techniques.append("BM25")
+        
+        return {
+            "success": True,
+            "message": f"Modern RAG created: {processing_stats['chunks']} chunks from {processing_stats['files']} files ({processing_stats['tokens']:,} tokens)",
+            "chunks": processing_stats["chunks"],
+            "files": processing_stats["files"],
+            "tokens": processing_stats["tokens"],
+            "time": total_time,
+            "techniques": techniques
+        }
+    
+    def create_search_indices(self, embeddings: np.ndarray, child_chunks: List[Dict], parent_chunks: List[Dict]) -> Dict:
+        """Create optimized search indices."""
+        if not child_chunks:
+            return {"vector_index": None, "bm25_index": None, "metadata": [], "parent_metadata": []}
+        
+        # Prepare child metadata (for retrieval)
+        child_metadata = []
+        for i, chunk in enumerate(child_chunks):
+            metadata = {
+                "content": chunk["content"],
+                "source": chunk.get("source", ""),
+                "chunk_id": i,
+                "tokens": chunk.get("tokens", 0),
+                "char_count": chunk.get("char_count", 0),
+                "chunk_type": chunk.get("chunk_type", "child"),
+                "parent_id": chunk.get("parent_id", -1),
+                "child_id": chunk.get("child_id", i),
+                "window_content": chunk.get("window_content", ""),
+                "sentence_range": chunk.get("sentence_range", (0, 0)),
+                "document_metadata": chunk.get("document_metadata", {}),
+                "file_index": chunk.get("file_index", 0)
+            }
+            child_metadata.append(metadata)
+        
+        # Prepare parent metadata
+        parent_metadata = []
+        for chunk in parent_chunks:
+            metadata = {
+                "content": chunk["content"],
+                "source": chunk.get("source", ""),
+                "parent_id": chunk.get("parent_id", -1),
+                "tokens": chunk.get("tokens", 0),
+                "chunk_type": "parent",
+                "document_metadata": chunk.get("document_metadata", {}),
+                "file_index": chunk.get("file_index", 0)
+            }
+            parent_metadata.append(metadata)
+        
+        # Create FAISS vector index
+        st.info("🔄 Creating optimized FAISS vector index...")
+        vector_index = self.create_faiss_index(embeddings)
+        
+        # Create BM25 index
+        bm25_index = None
+        tokenized_docs = None
+        if self.use_bm25:
+            st.info("🔄 Creating BM25 index...")
+            texts = [chunk["content"] for chunk in child_chunks]
+            tokenized_docs = [self._tokenize_for_bm25(text) for text in texts]
+            bm25_index = BM25Okapi(tokenized_docs)
+        
+        return {
+            "vector_index": vector_index,
+            "bm25_index": bm25_index,
+            "metadata": child_metadata,
+            "parent_metadata": parent_metadata,
+            "tokenized_docs": tokenized_docs
+        }
     
     def create_faiss_index(self, embeddings: np.ndarray):
         """Create optimized FAISS index."""
@@ -545,159 +853,153 @@ class TrueMultimodalRAGManager:
         dimension = embeddings.shape[1]
         n_vectors = embeddings.shape[0]
         
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        
         # Choose index type
         if n_vectors < 1000:
-            index = faiss.IndexFlatL2(dimension)
+            index = faiss.IndexFlatIP(dimension)  # Inner product for normalized vectors
+        elif n_vectors < 50000:
+            nlist = min(int(math.sqrt(n_vectors)), 1000)
+            quantizer = faiss.IndexFlatIP(dimension)
+            index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_INNER_PRODUCT)
+            index.train(embeddings)
         else:
-            nlist = min(100, n_vectors // 10)
-            quantizer = faiss.IndexFlatL2(dimension)
-            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+            # Large dataset - use PQ compression
+            nlist = min(int(math.sqrt(n_vectors)), 2000)
+            m = 16  # Subquantizers
+            quantizer = faiss.IndexFlatIP(dimension)
+            index = faiss.IndexIVFPQ(quantizer, dimension, nlist, m, 8)
             index.train(embeddings)
         
         # GPU acceleration
-        if self.use_gpu and n_vectors > 500:
+        if self.use_gpu and n_vectors > 1000:
             try:
                 res = faiss.StandardGpuResources()
                 gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
                 gpu_index.add(embeddings)
                 index = faiss.index_gpu_to_cpu(gpu_index)
-                st.success("🚀 Used GPU acceleration!")
-            except:
+                st.success("🚀 Used GPU acceleration for indexing!")
+            except Exception as e:
+                st.write(f"GPU indexing failed, using CPU: {str(e)}")
                 index.add(embeddings)
         else:
             index.add(embeddings)
         
         return index
     
-    def display_multimodal_results_streamlit(self, results: List[Dict]):
-        """Enhanced display of true multimodal results with embedded images."""
-        if not results:
-            st.info("No results found.")
-            return
-        
-        for i, result in enumerate(results, 1):
-            with st.expander(f"📄 Result {i} - {result.get('source', 'Unknown')}", expanded=(i<=2)):
-                # Display text content
-                st.markdown("**Content:**")
-                st.write(result.get("content", ""))
-                
-                # Display embedded images
-                embedded_images = result.get("embedded_images", [])
-                if embedded_images:
-                    st.markdown(f"**🖼️ Embedded Images ({len(embedded_images)}):**")
-                    
-                    # Create columns for better image layout
-                    cols = st.columns(min(2, len(embedded_images)))
-                    
-                    for idx, image_data in enumerate(embedded_images):
-                        col_idx = idx % len(cols)
-                        
-                        with cols[col_idx]:
-                            try:
-                                # Decode base64 image
-                                image_bytes = base64.b64decode(image_data["base64_data"])
-                                
-                                # Display image
-                                st.image(
-                                    image_bytes,
-                                    caption=f"Page {image_data['page_number']} ({image_data['width']}x{image_data['height']}, {image_data['size_kb']:.1f}KB)",
-                                    width=300
-                                )
-                                
-                                # Show image description if available
-                                if image_data.get("description"):
-                                    st.caption(f"📝 {image_data['description']}")
-                                
-                            except Exception as e:
-                                st.error(f"Error displaying embedded image {idx + 1}: {str(e)}")
-                    
-                    st.markdown("---")
-                else:
-                    st.info("No embedded images in this result.")
-                
-                # Display metadata
-                if result.get("rrf_score"):
-                    st.caption(f"Relevance Score: {result['rrf_score']:.4f}")
-                elif result.get("similarity_score"):
-                    st.caption(f"Similarity Score: {result['similarity_score']:.4f}")
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        """Tokenize text for BM25."""
+        # Simple but effective tokenization
+        text = re.sub(r'[^\w\s]', ' ', text.lower())
+        tokens = [token for token in text.split() if len(token) > 2]
+        return tokens
     
-    def hybrid_search(self, query: str, k: int = 10) -> List[Dict]:
-        """Enhanced hybrid search with multimodal query processing."""
-        indices = self.load_search_indices()
+    def modern_search(self, query: str, k: int = 8) -> List[Dict]:
+        """Perform modern RAG search with latest techniques."""
+        indices = self.load_indices()
         if not indices or not indices["metadata"]:
             return []
         
         vector_index = indices["vector_index"]
         bm25_index = indices["bm25_index"]
         metadata = indices["metadata"]
+        parent_metadata = indices.get("parent_metadata", [])
+        
+        # Query enhancement
+        enhanced_query = self.hyde_query_expansion(query)
+        expanded_query = self.expand_query(enhanced_query)
         
         all_results = []
         
-        # Vector search with multimodal query
+        # Vector search with enhanced query
         if vector_index:
-            # Create embedding for query (enhanced with any image context)
-            query_embedding = self.create_multimodal_embedding(query)
-            vector_results = self._vector_search_multimodal(query_embedding, vector_index, metadata, k)
-            for result in vector_results:
-                result["search_type"] = "vector_multimodal"
+            vector_results = self._modern_vector_search(expanded_query, vector_index, metadata, k * 3)
             all_results.extend(vector_results)
         
         # BM25 search
         if bm25_index and self.use_bm25:
-            bm25_results = self._bm25_search(query, bm25_index, metadata, k)
-            for result in bm25_results:
-                result["search_type"] = "bm25"
+            bm25_results = self._bm25_search(query, bm25_index, metadata, k * 2)
             all_results.extend(bm25_results)
         
-        # Enhanced reciprocal rank fusion
-        combined_results = self._enhanced_reciprocal_rank_fusion(all_results, k)
+        # Apply MMR for diversity
+        if self.use_mmr and vector_index and all_results:
+            try:
+                # Create query embedding for MMR
+                response = self.openai_client.embeddings.create(
+                    model=self.text_embedding_model,
+                    input=expanded_query[:8000]
+                )
+                query_embedding = np.array(response.data[0].embedding, dtype=np.float32)
+                
+                # Get embeddings for all results
+                result_indices = [r["chunk_id"] for r in all_results if "chunk_id" in r]
+                if result_indices:
+                    # Get embeddings from FAISS index
+                    result_embeddings = np.array([vector_index.reconstruct(i) for i in result_indices])
+                    
+                    # Apply MMR
+                    mmr_results = self.maximal_marginal_relevance(
+                        query_embedding, result_embeddings, all_results, k, self.mmr_diversity_score
+                    )
+                    
+                    if mmr_results:
+                        return mmr_results
+            except Exception as e:
+                st.warning(f"MMR failed, using standard ranking: {e}")
         
-        return combined_results[:k]
+        # Fallback: combine and rank results
+        if all_results:
+            combined_results = self._combine_results(all_results, k)
+            return combined_results[:k]
+        
+        return []
     
-    def _vector_search_multimodal(self, query_embedding: np.ndarray, index, metadata: List[Dict], k: int) -> List[Dict]:
-        """Enhanced vector search with embedded image data."""
+    def _modern_vector_search(self, query: str, index, metadata: List[Dict], k: int) -> List[Dict]:
+        """Modern vector search with enhancements."""
         try:
-            search_k = min(k * 3, index.ntotal)
-            distances, indices = index.search(query_embedding.reshape(1, -1), search_k)
+            response = self.openai_client.embeddings.create(
+                model=self.text_embedding_model,
+                input=query[:8000]
+            )
+            
+            query_embedding = np.array(response.data[0].embedding, dtype=np.float32)
+            faiss.normalize_L2(query_embedding.reshape(1, -1))
+            
+            search_k = min(k, index.ntotal)
+            scores, indices = index.search(query_embedding.reshape(1, -1), search_k)
             
             results = []
             for i, idx in enumerate(indices[0]):
                 if idx < len(metadata) and idx >= 0:
                     result = metadata[idx].copy()
-                    # Convert L2 distance to similarity score
-                    similarity = 1.0 / (1.0 + distances[0][i])
-                    result["similarity_score"] = float(distances[0][i])
-                    result["normalized_score"] = similarity
+                    result["similarity_score"] = float(scores[0][i])  # Inner product score
+                    result["search_type"] = "vector"
                     results.append(result)
             
             return results
             
         except Exception as e:
-            st.error(f"Multimodal vector search error: {str(e)}")
+            st.error(f"Vector search error: {str(e)}")
             return []
     
     def _bm25_search(self, query: str, bm25_index, metadata: List[Dict], k: int) -> List[Dict]:
-        """Enhanced BM25 search."""
+        """BM25 search."""
         try:
             query_tokens = self._tokenize_for_bm25(query)
-            
             if not query_tokens:
                 return []
             
             scores = bm25_index.get_scores(query_tokens)
-            
-            # Get top k indices with non-zero scores
             scored_indices = [(i, score) for i, score in enumerate(scores) if score > 0]
             scored_indices.sort(key=lambda x: x[1], reverse=True)
             
             results = []
-            for idx, score in scored_indices[:k * 2]:
+            for idx, score in scored_indices[:k]:
                 if idx < len(metadata):
                     result = metadata[idx].copy()
-                    normalized_score = min(score / 10.0, 1.0)
-                    result["similarity_score"] = float(1.0 - normalized_score)
                     result["bm25_score"] = float(score)
-                    result["normalized_score"] = normalized_score
+                    result["search_type"] = "bm25"
                     results.append(result)
             
             return results
@@ -706,253 +1008,158 @@ class TrueMultimodalRAGManager:
             st.error(f"BM25 search error: {str(e)}")
             return []
     
-    def _enhanced_reciprocal_rank_fusion(self, results: List[Dict], k: int) -> List[Dict]:
-        """Enhanced RRF for multimodal results."""
-        rrf_scores = {}
-        
-        # Group results by search type
-        vector_results = [r for r in results if "vector" in r.get("search_type", "")]
-        bm25_results = [r for r in results if r.get("search_type") == "bm25"]
-        
-        # Sort each group
-        vector_results.sort(key=lambda x: x.get("similarity_score", float('inf')))
-        bm25_results.sort(key=lambda x: x.get("similarity_score", float('inf')))
-        
-        # RRF parameters
-        rank_constant = 60
-        vector_weight = 0.7
-        bm25_weight = 0.3
-        
-        # Calculate RRF scores
-        for rank, result in enumerate(vector_results):
-            chunk_id = result["chunk_id"]
-            if chunk_id not in rrf_scores:
-                rrf_scores[chunk_id] = {"result": result, "score": 0}
-            
-            score_contribution = vector_weight / (rank_constant + rank + 1)
-            rrf_scores[chunk_id]["score"] += score_contribution
-        
-        for rank, result in enumerate(bm25_results):
-            chunk_id = result["chunk_id"]
-            if chunk_id not in rrf_scores:
-                rrf_scores[chunk_id] = {"result": result, "score": 0}
-            
-            score_contribution = bm25_weight / (rank_constant + rank + 1)
-            rrf_scores[chunk_id]["score"] += score_contribution
-        
-        # Sort by RRF score
-        sorted_results = sorted(rrf_scores.items(), key=lambda x: x[1]["score"], reverse=True)
-        
-        final_results = []
-        for chunk_id, data in sorted_results:
-            result = data["result"].copy()
-            result["rrf_score"] = data["score"]
-            result["similarity_score"] = 1.0 - data["score"]
-            final_results.append(result)
-        
-        return final_results
-    
-    def context_compression_multimodal(self, results: List[Dict], query: str, max_tokens: int = 4000) -> str:
-        """Enhanced context compression with multimodal awareness."""
-        if not results:
-            return ""
-        
-        # Sort by RRF score if available
-        results = sorted(results, 
-                        key=lambda x: x.get("rrf_score", 1.0 - x.get("similarity_score", 1.0)), 
-                        reverse=True)
-        
-        compressed_sections = []
-        total_tokens = 0
-        seen_content_hashes = set()
-        query_keywords = set(self._tokenize_for_bm25(query.lower()))
+    def _combine_results(self, results: List[Dict], k: int) -> List[Dict]:
+        """Combine and rank results."""
+        # Remove duplicates based on chunk_id
+        seen_chunks = set()
+        unique_results = []
         
         for result in results:
-            content = result.get("content", "")
-            title = result.get("title", "")
-            embedded_images = result.get("embedded_images", [])
+            chunk_id = result.get("chunk_id", -1)
+            if chunk_id not in seen_chunks:
+                seen_chunks.add(chunk_id)
+                unique_results.append(result)
+        
+        # Sort by best available score
+        def get_score(result):
+            if "similarity_score" in result:
+                return result["similarity_score"]
+            elif "bm25_score" in result:
+                return result["bm25_score"] / 10.0  # Normalize BM25
+            return 0
+        
+        unique_results.sort(key=get_score, reverse=True)
+        return unique_results
+    
+    def get_parent_context(self, child_result: Dict, parent_metadata: List[Dict]) -> str:
+        """Get parent context for a child chunk."""
+        parent_id = child_result.get("parent_id", -1)
+        if parent_id >= 0:
+            for parent in parent_metadata:
+                if parent.get("parent_id") == parent_id:
+                    return parent.get("content", "")
+        return child_result.get("content", "")
+    
+    def display_modern_results(self, results: List[Dict]):
+        """Display modern search results with context."""
+        if not results:
+            st.info("No results found.")
+            return
+        
+        indices = self.load_indices()
+        parent_metadata = indices.get("parent_metadata", [])
+        
+        for i, result in enumerate(results, 1):
+            source = result.get('source', 'Unknown')
             
-            # Skip very similar content
-            content_hash = hash(content[:300])
-            if content_hash in seen_content_hashes:
-                continue
-            seen_content_hashes.add(content_hash)
+            # Create enhanced title
+            title = f"📄 Result {i} - {source}"
+            techniques = []
+            if result.get("mmr_selected"):
+                techniques.append("MMR")
+            if result.get("search_type"):
+                techniques.append(result["search_type"].upper())
             
-            # Estimate tokens
-            content_tokens = self._estimate_tokens(content)
-            title_tokens = self._estimate_tokens(title) if title else 0
+            if techniques:
+                title += f" ({', '.join(techniques)})"
             
-            # Add image description tokens
-            image_tokens = 0
-            image_descriptions = []
-            for img in embedded_images:
-                desc = img.get("description", "")
-                if desc:
-                    image_descriptions.append(f"[Image: {desc}]")
-                    image_tokens += self._estimate_tokens(desc)
-            
-            section_tokens = content_tokens + title_tokens + image_tokens
-            
-            # Check if we can fit this section
-            if total_tokens + section_tokens > max_tokens:
-                break
-            
-            # Add content with image descriptions
-            if title:
-                section_text = f"**{title}**\n{content}"
-            else:
-                section_text = content
-            
-            # Add image descriptions
-            if image_descriptions:
-                section_text += f"\n\nImages in this section:\n" + "\n".join(image_descriptions)
+            with st.expander(title, expanded=(i <= 3)):
+                # Display main content
+                content = result.get("content", "")
+                st.write("**Chunk Content:**")
+                st.write(content)
                 
-            compressed_sections.append(section_text)
-            total_tokens += section_tokens
-        
-        return "\n\n---\n\n".join(compressed_sections)
+                # Show window content if different
+                window_content = result.get("window_content", "")
+                if window_content and window_content != content:
+                    st.write("**Sentence Window Context:**")
+                    st.write(window_content)
+                
+                # Show parent context if available (without nested expander)
+                if parent_metadata:
+                    parent_context = self.get_parent_context(result, parent_metadata)
+                    if parent_context and parent_context != content and len(parent_context) > len(content) * 1.5:
+                        st.write("**Full Parent Context:**")
+                        # Show first part of parent context with option to show more
+                        preview_length = 500
+                        if len(parent_context) > preview_length:
+                            st.write(parent_context[:preview_length] + "...")
+                            if st.button(f"📖 Show Full Parent Context", key=f"parent_{i}"):
+                                st.write("**Complete Parent Context:**")
+                                st.write(parent_context)
+                        else:
+                            st.write(parent_context)
+                
+                # Show metadata
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    if result.get("tokens"):
+                        st.caption(f"**Tokens:** {result['tokens']}")
+                    if result.get("chunk_type"):
+                        st.caption(f"**Type:** {result['chunk_type']}")
+                
+                with col2:
+                    # Show scores
+                    if result.get("similarity_score") is not None:
+                        st.caption(f"**Similarity:** {result['similarity_score']:.4f}")
+                    if result.get("bm25_score"):
+                        st.caption(f"**BM25:** {result['bm25_score']:.2f}")
+                
+                with col3:
+                    # Show IDs
+                    if result.get("parent_id", -1) >= 0:
+                        st.caption(f"**Parent ID:** {result['parent_id']}")
+                    if result.get("sentence_range"):
+                        start, end = result["sentence_range"]
+                        st.caption(f"**Sentences:** {start}-{end}")
+                
+                st.markdown("---")
     
-    def create_vector_store(self) -> Dict:
-        """Create true multimodal RAG system with embedded images."""
-        pdf_files = list(self.data_folder.glob("*.pdf"))
-        
-        if not pdf_files:
-            return {"success": False, "message": "No PDF files found in data folder"}
-        
-        max_files = 15
-        if len(pdf_files) > max_files:
-            st.warning(f"Processing first {max_files} of {len(pdf_files)} files")
-            pdf_files = pdf_files[:max_files]
-        
-        all_chunks = []
-        processing_stats = {"files": 0, "sections": 0, "chunks": 0, "images": 0}
-        
-        # Progress tracking
-        main_progress = st.progress(0)
-        main_status = st.empty()
-        start_time = time.time()
-        
-        # Phase 1: Extract text and embed images
-        main_status.text("🧠 Extracting text and embedding images...")
-        
-        for file_idx, pdf_file in enumerate(pdf_files):
-            st.write(f"\n### Processing {pdf_file.name}")
-            
-            # Extract text
-            text = self.extract_text_from_pdf(pdf_file)
-            
-            # Extract and encode images for embedding
-            images_data = []
-            if self.use_multimodal:
-                images_data = self.extract_and_encode_images_from_pdf(pdf_file)
-                processing_stats["images"] += len(images_data)
-            
-            if not text and not images_data:
-                st.warning(f"No content extracted from {pdf_file.name}")
-                continue
-            
-            # Process text
-            processed = self.intelligent_text_preprocessing(text) if text else {"sections": [], "metadata": {}}
-            processing_stats["sections"] += len(processed["sections"])
-            
-            # Create chunks with embedded images
-            chunks = self.intelligent_chunking_with_embedded_images(processed["sections"], images_data)
-            processing_stats["chunks"] += len(chunks)
-            
-            # Add metadata
-            for chunk in chunks:
-                chunk["source"] = pdf_file.name
-                chunk["file_metadata"] = processed["metadata"]
-                chunk["file_index"] = file_idx
-            
-            all_chunks.extend(chunks)
-            processing_stats["files"] += 1
-            
-            st.success(f"✅ Processed {pdf_file.name}: {len(chunks)} chunks, {len(images_data)} embedded images")
-            
-            # Update progress
-            file_progress = (file_idx + 1) / len(pdf_files) * 0.4
-            main_progress.progress(file_progress)
-        
-        if not all_chunks:
-            return {"success": False, "message": "No content extracted from PDF files"}
-        
-        # Limit chunks if too many
-        max_total_chunks = self.max_chunks_per_file * len(pdf_files)
-        if len(all_chunks) > max_total_chunks:
-            st.info(f"Limiting to {max_total_chunks} chunks for optimal performance")
-            all_chunks = all_chunks[:max_total_chunks]
-            processing_stats["chunks"] = len(all_chunks)
-        
-        main_status.text(f"📊 Creating true multimodal search indices...")
-        main_progress.progress(0.4)
-        
-        # Phase 2: Create multimodal search indices
+    def save_indices(self, indices: Dict):
+        """Save modern indices to disk."""
         try:
-            indices = self.create_multimodal_search_index(all_chunks)
-            main_progress.progress(0.9)
-        except Exception as e:
-            return {"success": False, "message": f"Error creating indices: {str(e)}"}
-        
-        # Phase 3: Save everything
-        main_status.text("💾 Saving true multimodal RAG system...")
-        
-        try:
-            self.save_search_indices(indices)
-        except Exception as e:
-            return {"success": False, "message": f"Error saving: {str(e)}"}
-        
-        # Complete
-        total_time = time.time() - start_time
-        main_progress.progress(1.0)
-        main_status.text(f"✅ True multimodal RAG system created in {total_time:.1f}s!")
-        
-        search_types = ["Multimodal Vector (True)"]
-        if self.use_bm25:
-            search_types.append("BM25 Sparse")
-        
-        return {
-            "success": True,
-            "message": f"True multimodal RAG created: {processing_stats['chunks']} chunks with {processing_stats['images']} embedded images from {processing_stats['files']} files",
-            "chunks": processing_stats["chunks"],
-            "files": processing_stats["files"],
-            "sections": processing_stats["sections"],
-            "images": processing_stats["images"],
-            "time": total_time,
-            "search_types": search_types
-        }
-    
-    def save_search_indices(self, indices: Dict):
-        """Save search indices with embedded image data."""
-        # Save vector index
-        if indices["vector_index"]:
-            vector_path = self.vector_store_path / "faiss_index.bin"
-            faiss.write_index(indices["vector_index"], str(vector_path))
-        
-        # Save metadata with embedded images
-        metadata_path = self.vector_store_path / "multimodal_metadata.pkl"
-        save_data = {
-            "metadata": indices["metadata"],
-            "bm25_index": indices["bm25_index"],
-            "tokenized_docs": indices.get("tokenized_docs"),
-            "creation_time": time.time(),
-            "system_info": {
-                "chunk_size": self.chunk_size,
-                "chunk_overlap": self.chunk_overlap,
-                "use_bm25": self.use_bm25,
-                "use_multimodal": self.use_multimodal,
-                "text_embedding_model": self.text_embedding_model,
-                "is_true_multimodal": True  # Flag for new system
+            # Save vector index
+            if indices["vector_index"]:
+                vector_path = self.vector_store_path / "faiss_index.bin"
+                faiss.write_index(indices["vector_index"], str(vector_path))
+            
+            # Save metadata and other components
+            metadata_path = self.vector_store_path / "modern_metadata.pkl"
+            save_data = {
+                "metadata": indices["metadata"],
+                "parent_metadata": indices.get("parent_metadata", []),
+                "bm25_index": indices["bm25_index"],
+                "tokenized_docs": indices.get("tokenized_docs"),
+                "creation_time": time.time(),
+                "system_info": {
+                    "chunk_size": self.chunk_size,
+                    "chunk_overlap": self.chunk_overlap,
+                    "use_bm25": self.use_bm25,
+                    "use_hyde": self.use_hyde,
+                    "use_query_expansion": self.use_query_expansion,
+                    "use_mmr": self.use_mmr,
+                    "text_embedding_model": self.text_embedding_model,
+                    "system_type": "modern_rag",
+                    "tokenizer": "tiktoken",
+                    "parent_chunk_size": self.parent_chunk_size,
+                    "sentence_window_size": self.sentence_window_size
+                }
             }
-        }
-        
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(save_data, f)
+            
+            with open(metadata_path, 'wb') as f:
+                pickle.dump(save_data, f)
+            
+            st.success("✅ Successfully saved modern RAG system")
+            
+        except Exception as e:
+            st.error(f"Error saving indices: {str(e)}")
+            raise
     
-    def load_search_indices(self) -> Dict:
-        """Load search indices with embedded image data."""
+    def load_indices(self) -> Dict:
+        """Load modern indices from disk."""
         vector_path = self.vector_store_path / "faiss_index.bin"
-        metadata_path = self.vector_store_path / "multimodal_metadata.pkl"
+        metadata_path = self.vector_store_path / "modern_metadata.pkl"
         
         if not (vector_path.exists() and metadata_path.exists()):
             return {}
@@ -965,44 +1172,42 @@ class TrueMultimodalRAGManager:
             with open(metadata_path, 'rb') as f:
                 data = pickle.load(f)
             
-            # Validate data structure
-            metadata = data.get("metadata", [])
-            if not isinstance(metadata, list):
-                raise ValueError("Invalid metadata format")
-            
             return {
                 "vector_index": vector_index,
                 "bm25_index": data.get("bm25_index"),
-                "metadata": metadata,
+                "metadata": data.get("metadata", []),
+                "parent_metadata": data.get("parent_metadata", []),
                 "tokenized_docs": data.get("tokenized_docs"),
                 "system_info": data.get("system_info", {})
             }
+            
         except Exception as e:
             st.error(f"Error loading search indices: {str(e)}")
             return {}
     
     def extract_text_from_pdf(self, pdf_path: Path) -> str:
-        """Extract text from PDF."""
+        """Extract text from PDF with quality improvements."""
         try:
             with open(pdf_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
                 
-                max_pages = min(150, len(pdf_reader.pages))
+                max_pages = min(250, len(pdf_reader.pages))
                 text_parts = []
                 
                 for i, page in enumerate(pdf_reader.pages[:max_pages]):
                     try:
                         text = page.extract_text()
                         if text and text.strip():
-                            text = re.sub(r'\s+', ' ', text.strip())
-                            text_parts.append(text)
+                            cleaned_text = self._clean_text(text)
+                            if len(cleaned_text) > 50:
+                                text_parts.append(cleaned_text)
                     except Exception:
                         continue
                 
                 if not text_parts:
                     return ""
                 
-                full_text = "\n".join(text_parts)
+                full_text = "\n\n".join(text_parts)
                 
                 if len(pdf_reader.pages) > max_pages:
                     st.info(f"Processed {max_pages} of {len(pdf_reader.pages)} pages from {pdf_path.name}")
@@ -1012,30 +1217,7 @@ class TrueMultimodalRAGManager:
         except Exception as e:
             st.error(f"Error reading PDF {pdf_path.name}: {str(e)}")
             return ""
-    
-    def search_similar(self, query: str, k: int = 8) -> List[Dict]:
-        """Main search interface using true multimodal approach."""
-        try:
-            # Use enhanced hybrid search
-            results = self.hybrid_search(query, k)
-            
-            # Ensure full content and embedded images are available
-            indices = self.load_search_indices()
-            if indices and indices["metadata"]:
-                metadata = indices["metadata"]
-                for result in results:
-                    chunk_id = result.get("chunk_id", -1)
-                    if 0 <= chunk_id < len(metadata):
-                        # Metadata now stores embedded images
-                        result["content"] = metadata[chunk_id].get("content", result.get("content", ""))
-                        result["embedded_images"] = metadata[chunk_id].get("embedded_images", [])
-                        result["has_images"] = metadata[chunk_id].get("has_images", False)
-            
-            return results
-            
-        except Exception as e:
-            st.error(f"True multimodal search error: {str(e)}")
-            return []
+
 
 class ToolPlugin:
     """A plugin that exposes tools for the chatbot."""
@@ -1079,20 +1261,6 @@ class ToolPlugin:
         """Placeholder function to handle knowledge base searches."""
         return "Knowledge base search request has been logged."
 
-def create_tool_dict(metadata):
-    """Convert KernelFunctionMetadata to dictionary format for tools."""
-    return {
-        "type": "function",
-        "function": {
-            "name": metadata.fully_qualified_name,
-            "description": metadata.description,
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    }
 
 def categorize_with_direct_openai(openai_client, user_input, model_name):
     """Use direct OpenAI client to categorize user input with context awareness."""
@@ -1153,7 +1321,7 @@ Category:"""
                 return "Book Hotel"
             elif "limo" in category_lower or "transport" in category_lower or "ride" in category_lower:
                 return "Book Limo"
-            elif "search" in category_lower or "document" in category_lower or "find" in category_lower or "knowledge" in category_lower or "what" in category_lower:
+            elif "search" in category_lower or "document" in category_lower or "find" in category_lower or "knowledge" in category_lower or "what" in category_lower or "how" in category_lower:
                 return "Search Knowledge Base"
             else:
                 # Enhanced fallback logic with context awareness
@@ -1167,6 +1335,7 @@ Category:"""
     except Exception as e:
         st.error(f"LLM categorization failed: {str(e)}")
         return None
+
 
 @st.cache_resource
 def initialize_chatbot():
@@ -1211,6 +1380,7 @@ def initialize_chatbot():
 
     return kernel, chat_service, openai_client
 
+
 def show_debug_panel(openai_client, model_name, base_endpoint, api_version, api_key):
     """Show debug panel with configuration and test connection."""
     with st.sidebar:
@@ -1236,6 +1406,7 @@ def show_debug_panel(openai_client, model_name, base_endpoint, api_version, api_
                     elif "401" in str(e):
                         st.warning("💡 Check your API key and endpoint URL")
 
+
 async def process_request(kernel, category, function_name):
     """Process the user request and call the appropriate function."""
     try:
@@ -1249,187 +1420,319 @@ async def process_request(kernel, category, function_name):
         st.error(f"Error calling function: {e}")
         return f"Request logged successfully (local fallback)."
 
-def create_true_multimodal_vector_store_ui(openai_client, model_name):
-    """True Multimodal RAG UI with embedded image storage."""
+
+def create_modern_rag_ui(openai_client, model_name):
+    """Modern RAG UI with latest techniques."""
     st.sidebar.markdown("---")
-    st.sidebar.header("🚀 True Multimodal RAG (Images in Embeddings)")
+    st.sidebar.header("🚀 Modern RAG System")
     
-    # Check if vector store dependencies are available
     if not VECTOR_STORE_AVAILABLE:
-        st.sidebar.error("❌ Vector store dependencies not installed")
-        st.sidebar.code("pip install faiss-cpu PyPDF2 rank-bm25 PyMuPDF Pillow")
+        st.sidebar.error("❌ Dependencies not installed")
+        st.sidebar.code("pip install faiss-cpu PyPDF2 rank-bm25 tiktoken")
         return None
     
-    # Initialize true multimodal RAG manager
-    if "vector_manager" not in st.session_state:
+    # Initialize manager
+    if "modern_rag_manager" not in st.session_state:
         try:
-            st.session_state.vector_manager = TrueMultimodalRAGManager(openai_client, model_name)
+            st.session_state.modern_rag_manager = ModernRAGManager(openai_client, model_name)
         except Exception as e:
-            st.sidebar.error(f"Error initializing true multimodal RAG: {str(e)}")
+            st.sidebar.error(f"Error initializing: {str(e)}")
             return None
     
-    vector_manager = st.session_state.vector_manager
+    manager = st.session_state.modern_rag_manager
     
     # Check data folder
     data_folder = Path("data")
     pdf_files = list(data_folder.glob("*.pdf")) if data_folder.exists() else []
     
-    st.sidebar.markdown(f"**PDF Files in Data Folder:** {len(pdf_files)}")
-    
-    if len(pdf_files) > 15:
-        st.sidebar.warning(f"⚠️ {len(pdf_files)} PDF files found. First 15 will be processed.")
+    st.sidebar.markdown(f"**PDF Files:** {len(pdf_files)}")
     
     if pdf_files:
-        with st.sidebar.expander("📄 Available PDF Files", expanded=False):
-            for i, pdf_file in enumerate(pdf_files[:15]):
-                file_size = pdf_file.stat().st_size / (1024 * 1024)  # MB
-                status = "✅" if file_size <= 15 else "⚠️"
+        with st.sidebar.expander("📄 PDF Files", expanded=False):
+            for pdf_file in pdf_files[:25]:
+                file_size = pdf_file.stat().st_size / (1024 * 1024)
+                status = "✅" if file_size <= 30 else "⚠️"
                 st.write(f"{status} {pdf_file.name} ({file_size:.1f}MB)")
-            if len(pdf_files) > 15:
-                st.write(f"... and {len(pdf_files) - 15} more files")
     else:
         st.sidebar.warning("⚠️ No PDF files found in 'data' folder")
-        st.sidebar.markdown("*Place PDF files in the 'data' folder*")
     
-    # Enhanced features info
-    feature_text = """⚡ **True Multimodal Features:**
-- **Images stored in embeddings** (not as files)
-- **True multimodal embeddings** with image content
-- **Base64 image encoding** for vector storage
-- **Inline image display** with search results
-- **Vision model analysis** of image content
+    # Features
+    st.sidebar.info("""⚡ **Modern RAG Features:**
+- **Token-based chunking** with tiktoken
+- **Recursive text splitting** (LangChain-style)
+- **Parent-child chunks** for context
+- **Sentence window** retrieval
+- **HyDE** (Hypothetical Document Embeddings)
+- **Query expansion** with LLM
+- **MMR** (Maximal Marginal Relevance)
 - **Hybrid search** (Vector + BM25)
-- **Intelligent preprocessing** and chunking
-- **Context compression** with image awareness
+- **Cosine similarity** with normalized embeddings
+- **Support up to 25 PDF files**
 - **GPU acceleration** when available
-- **Process up to 15 PDF files**
-- **Files up to 15MB** supported
-- **Smart image size optimization**
-"""
+""")
     
-    if not MULTIMODAL_AVAILABLE:
-        feature_text += "\n- ⚠️ **Image support disabled** (install PyMuPDF + Pillow)"
+    # Check if system exists
+    indices = manager.load_indices()
+    system_exists = bool(indices and indices.get("metadata"))
     
-    st.sidebar.info(feature_text)
-    
-    # Check if true multimodal indices exist
-    indices = vector_manager.load_search_indices()
-    vector_store_exists = bool(indices and indices.get("metadata"))
-    
-    if vector_store_exists:
-        st.sidebar.success("✅ True Multimodal RAG system exists")
+    if system_exists:
+        st.sidebar.success("✅ Modern RAG System exists")
         
-        try:
-            metadata = indices.get("metadata", [])
-            if metadata:
-                st.sidebar.markdown(f"**Chunks:** {len(metadata)}")
-                
-                # Count embedded images
-                total_images = sum(len(item.get("embedded_images", [])) for item in metadata)
-                if total_images > 0:
-                    st.sidebar.markdown(f"**Embedded Images:** {total_images}")
-                
-                # Get unique sources
-                sources = set(item["source"] for item in metadata if "source" in item)
-                st.sidebar.markdown(f"**Sources:** {len(sources)}")
-                
-                # Show search capabilities
-                search_types = ["True Multimodal Vector"]
-                if indices.get("bm25_index") and BM25_AVAILABLE:
-                    search_types.append("BM25 Sparse")
-                st.sidebar.markdown(f"**Search Types:** {', '.join(search_types)}")
-                
-                # Show system type
-                system_info = indices.get("system_info", {})
-                if system_info.get("is_true_multimodal"):
-                    st.sidebar.success("🎯 True Multimodal System")
-                else:
-                    st.sidebar.warning("⚠️ Old System (Upgrade Recommended)")
-        except:
-            pass
+        metadata = indices.get("metadata", [])
+        parent_metadata = indices.get("parent_metadata", [])
+        
+        if metadata:
+            st.sidebar.markdown(f"**Child Chunks:** {len(metadata)}")
+            st.sidebar.markdown(f"**Parent Chunks:** {len(parent_metadata)}")
+            
+            # Show statistics
+            total_tokens = sum(item.get("tokens", 0) for item in metadata)
+            st.sidebar.markdown(f"**Total Tokens:** {total_tokens:,}")
+            
+            sources = set(item.get("source", "") for item in metadata)
+            st.sidebar.markdown(f"**Sources:** {len(sources)}")
+            
+            # Show techniques used
+            system_info = indices.get("system_info", {})
+            techniques = []
+            if system_info.get("use_hyde"):
+                techniques.append("HyDE")
+            if system_info.get("use_query_expansion"):
+                techniques.append("Query Expansion")
+            if system_info.get("use_mmr"):
+                techniques.append("MMR")
+            if system_info.get("use_bm25"):
+                techniques.append("BM25")
+            
+            if techniques:
+                st.sidebar.markdown(f"**Techniques:** {', '.join(techniques)}")
     else:
-        st.sidebar.info("ℹ️ No true multimodal RAG system found")
+        st.sidebar.info("ℹ️ No modern RAG system found")
     
     # Create/Recreate button
-    button_text = "🔄 Recreate True Multimodal RAG" if vector_store_exists else "🚀 Create True Multimodal RAG"
+    button_text = "🔄 Recreate Modern RAG" if system_exists else "🚀 Create Modern RAG System"
     
     if st.sidebar.button(button_text, disabled=(len(pdf_files) == 0)):
         if len(pdf_files) == 0:
-            st.sidebar.error("❌ No PDF files found to process")
+            st.sidebar.error("❌ No PDF files found")
         else:
             with st.sidebar:
-                st.markdown("### 🚀 Creating True Multimodal RAG System")
+                st.markdown("### 🚀 Creating Modern RAG System")
                 try:
-                    result = vector_manager.create_vector_store()
+                    result = manager.create_vector_store()
                     
                     if result["success"]:
                         st.success(f"✅ {result['message']}")
-                        if result.get("images", 0) > 0:
-                            st.info(f"🖼️ Embedded {result['images']} images in vector store")
+                        st.info(f"🎯 Techniques: {', '.join(result['techniques'])}")
+                        st.info(f"⏱️ Processing: {result.get('time', 0):.1f}s for {result.get('tokens', 0):,} tokens")
                         st.balloons()
-                        
-                        # Show capabilities
-                        if "search_types" in result:
-                            st.info(f"🔍 Search types: {', '.join(result['search_types'])}")
                     else:
                         st.error(f"❌ {result['message']}")
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
     
-    # Enhanced search interface
-    if vector_store_exists:
+    # Search interface
+    if system_exists:
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🔍 True Multimodal Search")
+        st.sidebar.subheader("🔍 Modern RAG Search")
         
-        search_query = st.sidebar.text_input("Search query:", placeholder="Search PDFs with images...")
+        search_query = st.sidebar.text_input("Search:", placeholder="Ask about document content...")
         
-        if st.sidebar.button("🔍 Multimodal Search") and search_query:
+        if st.sidebar.button("🚀 Modern Search") and search_query:
             with st.sidebar:
-                with st.spinner("Searching..."):
+                with st.spinner("Searching with modern techniques..."):
                     try:
                         start_time = time.time()
-                        results = vector_manager.search_similar(search_query, k=3)
+                        results = manager.modern_search(search_query, k=6)
                         search_time = time.time() - start_time
                         
                         if results:
                             st.success(f"Found {len(results)} results in {search_time:.2f}s")
                             
-                            # Show condensed results
+                            # Show preview
                             for i, result in enumerate(results, 1):
-                                with st.expander(f"Result {i} - {result.get('source', 'Unknown')}", expanded=(i==1)):
-                                    # Show text preview
-                                    content = result.get('content', '')
-                                    preview = content[:150] + "..." if len(content) > 150 else content
-                                    st.write(f"**Content:** {preview}")
+                                source = result.get("source", "Unknown")
+                                techniques = []
+                                if result.get("mmr_selected"):
+                                    techniques.append("MMR")
+                                if result.get("search_type"):
+                                    techniques.append(result["search_type"].upper())
+                                
+                                technique_str = f" ({', '.join(techniques)})" if techniques else ""
+                                
+                                with st.expander(f"Preview {i} - {source}{technique_str}", expanded=(i==1)):
+                                    content = result.get("content", "")[:200]
+                                    if len(result.get("content", "")) > 200:
+                                        content += "..."
                                     
-                                    # Show embedded images count
-                                    embedded_images = result.get("embedded_images", [])
-                                    if embedded_images:
-                                        st.write(f"**🖼️ Embedded Images:** {len(embedded_images)}")
-                                        
-                                        # Show first image thumbnail
-                                        if len(embedded_images) > 0:
-                                            try:
-                                                image_data = embedded_images[0]
-                                                image_bytes = base64.b64decode(image_data["base64_data"])
-                                                st.image(
-                                                    image_bytes,
-                                                    caption=f"Page {image_data['page_number']}",
-                                                    width=200
-                                                )
-                                            except:
-                                                st.write("Image preview unavailable")
+                                    st.write(f"**Text:** {content}")
                                     
-                                    # Show relevance score
-                                    rrf_score = result.get('rrf_score')
-                                    if rrf_score:
-                                        st.write(f"**Relevance:** {rrf_score:.4f}")
+                                    # Show scores
+                                    if result.get("similarity_score") is not None:
+                                        st.caption(f"Similarity: {result['similarity_score']:.4f}")
+                                    if result.get("bm25_score"):
+                                        st.caption(f"BM25: {result['bm25_score']:.2f}")
                         else:
-                            st.info("No relevant results found")
+                            st.info("No results found")
                     except Exception as e:
                         st.error(f"Search error: {str(e)}")
     
-    return vector_manager
+    return manager
+
+
+def handle_modern_knowledge_base(query, manager):
+    """Handle Knowledge Base queries with modern RAG techniques."""
+    st.markdown("🚀 **Modern RAG Knowledge Base Agent** is assisting you.")
+    
+    # Check if system exists
+    indices = manager.load_indices()
+    if not indices or not indices.get("metadata"):
+        st.error("❌ No modern RAG system found. Please create one first.")
+        return "No system found."
+    
+    # Show system status
+    metadata = indices.get("metadata", [])
+    parent_metadata = indices.get("parent_metadata", [])
+    total_tokens = sum(item.get("tokens", 0) for item in metadata)
+    
+    system_info = indices.get("system_info", {})
+    techniques = []
+    if system_info.get("use_hyde"):
+        techniques.append("HyDE")
+    if system_info.get("use_query_expansion"):
+        techniques.append("Query Expansion")
+    if system_info.get("use_mmr"):
+        techniques.append("MMR")
+    if system_info.get("use_bm25"):
+        techniques.append("BM25")
+    
+    st.success(f"🚀 Using Modern RAG: {len(metadata)} chunks, {len(parent_metadata)} parents, {total_tokens:,} tokens ({', '.join(techniques)})")
+    
+    # Process the query
+    with st.spinner("🔍 Searching with modern RAG techniques..."):
+        try:
+            start_time = time.time()
+            
+            # Determine search scope
+            general_queries = ["what information", "what's in", "what is in", "what does the document contain", 
+                             "what topics", "summarize", "overview", "what's available"]
+            is_general_query = any(phrase in query.lower() for phrase in general_queries)
+            
+            # Search with appropriate scope
+            if is_general_query:
+                results = manager.modern_search(query, k=10)
+            else:
+                results = manager.modern_search(query, k=8)
+            
+            search_time = time.time() - start_time
+            
+            if results:
+                # Display results
+                st.markdown(f"### 🚀 Modern RAG Search Results")
+                st.write(f"*Found {len(results)} relevant sections in {search_time:.2f}s*")
+                
+                # Show techniques used
+                techniques_used = set()
+                for result in results:
+                    if result.get("mmr_selected"):
+                        techniques_used.add("MMR")
+                    if result.get("search_type"):
+                        techniques_used.add(result["search_type"].upper())
+                
+                if techniques_used:
+                    st.info(f"🎯 Applied techniques: {', '.join(techniques_used)}")
+                
+                manager.display_modern_results(results)
+                
+                # Generate AI summary
+                try:
+                    openai_client = st.session_state.get('openai_client')
+                    model_name = os.getenv("DEPLOYMENT_NAME")
+                    
+                    if openai_client and model_name:
+                        # Create context from results
+                        context_parts = []
+                        for result in results[:5]:  # Use top 5 results
+                            # Use window content if available for better context
+                            content = result.get("window_content", result.get("content", ""))
+                            context_parts.append(content)
+                        
+                        context = "\n\n".join(context_parts)
+                        
+                        if context:
+                            if is_general_query:
+                                summary_prompt = f"""Based on the following content from documents, provide a comprehensive overview of what information is available.
+
+User Question: {query}
+
+Document Content:
+{context}
+
+Provide a helpful summary of the main topics, types of information, and key content available."""
+                            else:
+                                summary_prompt = f"""Based on the following content from documents, answer the user's question directly and comprehensively.
+
+User Question: {query}
+
+Document Content:
+{context}
+
+Provide a clear, detailed answer based on the content above."""
+
+                            response = openai_client.chat.completions.create(
+                                model=model_name,
+                                messages=[{"role": "user", "content": summary_prompt}],
+                                temperature=0.05,
+                                max_tokens=800
+                            )
+                            
+                            ai_summary = response.choices[0].message.content.strip()
+                            
+                            # Display AI summary
+                            st.markdown("### 🤖 AI Summary")
+                            st.write(ai_summary)
+                            
+                            final_result = f"{ai_summary}\n\n*🚀 Modern RAG search completed in {search_time:.2f}s*"
+                            return final_result
+                            
+                except Exception as e:
+                    st.warning(f"AI summary generation failed: {str(e)}")
+                
+                return f"Found {len(results)} relevant sections with modern RAG techniques in {search_time:.2f}s"
+                
+            else:
+                # Show sample content if no results
+                try:
+                    if metadata:
+                        st.markdown("No specific matches found, but here's sample content from your modern RAG system:")
+                        
+                        sample_items = metadata[:4]
+                        for i, item in enumerate(sample_items, 1):
+                            with st.expander(f"Sample {i} (from {item.get('source', 'Unknown')})", expanded=(i==1)):
+                                content = item.get('content', '')[:400]
+                                if len(item.get('content', '')) > 400:
+                                    content += "..."
+                                st.write(content)
+                                
+                                # Show metadata
+                                if item.get('tokens'):
+                                    st.caption(f"Tokens: {item['tokens']}, Type: {item.get('chunk_type', 'child')}")
+                        
+                        return f"Sample content shown. Total: {len(metadata)} chunks with {total_tokens:,} tokens."
+                    else:
+                        return "No relevant information found. Try rephrasing your question."
+                except:
+                    return "No relevant information found. Try rephrasing your question."
+                
+        except Exception as e:
+            error_msg = str(e)
+            if "404" in error_msg:
+                return "Unable to search due to AI service configuration issue."
+            elif "401" in error_msg:
+                return "Unable to search due to authentication issues."
+            else:
+                return f"Search error: {error_msg}"
+
 
 def handle_agent_conversation(category):
     """Handle specialized agent conversation based on category."""
@@ -1491,245 +1794,64 @@ def handle_agent_conversation(category):
             return True
             
     elif category == "Search Knowledge Base":
-        st.markdown("📚🖼️ **True Multimodal Knowledge Base Agent** is now assisting you.")
+        st.markdown("🚀 **Modern RAG Knowledge Base Agent** is now assisting you.")
         
-        # Check if vector store exists
-        if "vector_manager" not in st.session_state:
-            st.error("❌ True Multimodal RAG not initialized. Please create a system first.")
+        # Check if modern manager exists
+        if "modern_rag_manager" not in st.session_state or st.session_state.modern_rag_manager is None:
+            st.error("❌ Modern RAG not initialized. Please create a system first.")
             if st.button("Return to Main Agent"):
                 return True
             return False
         
-        vector_manager = st.session_state.vector_manager
-        indices = vector_manager.load_search_indices()
+        manager = st.session_state.modern_rag_manager
+        indices = manager.load_indices()
         
         if not indices or not indices.get("metadata"):
-            st.error("❌ No true multimodal RAG system found. Please create one first.")
+            st.error("❌ No modern RAG system found. Please create one first.")
             if st.button("Return to Main Agent"):
                 return True
             return False
         
-        # Show system type
+        # Show system status
         system_info = indices.get("system_info", {})
-        if system_info.get("is_true_multimodal"):
-            st.success("🎯 Using True Multimodal System with embedded images")
-        else:
-            st.warning("⚠️ Using legacy system - consider recreating for better multimodal support")
+        techniques = []
+        if system_info.get("use_hyde"):
+            techniques.append("HyDE")
+        if system_info.get("use_query_expansion"):
+            techniques.append("Query Exp")
+        if system_info.get("use_mmr"):
+            techniques.append("MMR")
+        if system_info.get("use_bm25"):
+            techniques.append("BM25")
+        
+        st.success(f"🚀 Using Modern RAG ({', '.join(techniques)})")
         
         # Check for original query from routing
         original_query = st.session_state.get('original_user_query', '')
         
         if original_query and not st.session_state.get('kb_query_processed', False):
-            # Process the original query with true multimodal search
-            with st.spinner("🔍 True multimodal searching..."):
-                try:
-                    start_time = time.time()
-                    
-                    # Determine search scope
-                    general_queries = ["what information", "what's in", "what is in", "what does the document contain", 
-                                     "what topics", "summarize", "overview", "what's available"]
-                    is_general_query = any(phrase in original_query.lower() for phrase in general_queries)
-                    
-                    # Use enhanced search
-                    if is_general_query:
-                        results = vector_manager.search_similar(original_query, k=12)
-                    else:
-                        results = vector_manager.search_similar(original_query, k=8)
-                    
-                    search_time = time.time() - start_time
-                    
-                    if results:
-                        # Display true multimodal results
-                        st.markdown("### 🚀 True Multimodal Search Results")
-                        st.write(f"*Found {len(results)} relevant sections with embedded images in {search_time:.2f}s*")
-                        
-                        # Enhanced multimodal display
-                        vector_manager.display_multimodal_results_streamlit(results)
-                        
-                        # Generate AI summary with multimodal context
-                        try:
-                            openai_client = st.session_state.get('openai_client')
-                            model_name = os.getenv("DEPLOYMENT_NAME")
-                            
-                            if openai_client and model_name:
-                                max_tokens = 6000 if is_general_query else 4000
-                                compressed_context = vector_manager.context_compression_multimodal(results, original_query, max_tokens)
-                                
-                                if compressed_context:
-                                    if is_general_query:
-                                        summary_prompt = f"""Based on the following multimodal content from documents (text + embedded image descriptions), provide a comprehensive overview of what information is available.
-
-User Question: {original_query}
-
-Multimodal Document Content:
-{compressed_context}
-
-Please provide a helpful summary of the main topics, types of information, and key content available, including visual elements described in the images."""
-                                    else:
-                                        summary_prompt = f"""Based on the following multimodal content from documents (text + embedded image descriptions), provide a clear answer to the user's question.
-
-User Question: {original_query}
-
-Relevant Multimodal Content:
-{compressed_context}
-
-Please provide a direct, accurate answer based on both the text content and visual information described above."""
-
-                                    response = openai_client.chat.completions.create(
-                                        model=model_name,
-                                        messages=[{"role": "user", "content": summary_prompt}],
-                                        temperature=0.05,
-                                        max_tokens=800
-                                    )
-                                    
-                                    ai_summary = response.choices[0].message.content.strip()
-                                    
-                                    # Display AI summary
-                                    st.markdown("### 🤖 AI Summary (True Multimodal)")
-                                    st.write(ai_summary)
-                                    
-                                    final_answer = f"{ai_summary}\n\n*🚀 True multimodal search with {len(results)} sections and embedded images in {search_time:.2f}s*"
-                                    
-                        except Exception as e:
-                            # Fallback to context display
-                            final_answer = f"Based on multimodal documents:\n{compressed_context}\n\n*🚀 True multimodal search found {len(results)} sections in {search_time:.2f}s*"
-                        
-                        st.session_state.agent_complete = True
-                        st.session_state.agent_result = final_answer
-                        st.session_state.kb_query_processed = True
-                        return True
-                        
-                    else:
-                        # Show sample content
-                        try:
-                            metadata = indices.get("metadata", [])
-                            if metadata:
-                                st.markdown("No specific matches found, but here's sample content from your true multimodal knowledge base:")
-                                
-                                for i, item in enumerate(metadata[:3], 1):
-                                    with st.expander(f"Sample {i} (from {item.get('source', 'Unknown')})", expanded=(i==1)):
-                                        content = item.get('content', '')[:400]
-                                        if len(item.get('content', '')) > 400:
-                                            content += "..."
-                                        st.write(content)
-                                        
-                                        # Show embedded images
-                                        embedded_images = item.get("embedded_images", [])
-                                        if embedded_images:
-                                            st.write(f"*Contains {len(embedded_images)} embedded image(s)*")
-                                            # Show first image
-                                            try:
-                                                image_data = embedded_images[0]
-                                                image_bytes = base64.b64decode(image_data["base64_data"])
-                                                st.image(image_bytes, width=200)
-                                            except:
-                                                st.write("Image preview unavailable")
-                                
-                                total_images = sum(len(item.get("embedded_images", [])) for item in metadata)
-                                st.write(f"*Total: {len(metadata)} sections with {total_images} embedded images*")
-                                
-                                final_answer = f"Sample content shown. Total: {len(metadata)} sections with {total_images} embedded images."
-                            else:
-                                final_answer = "No relevant information found. Try rephrasing your question."
-                        except:
-                            final_answer = "No relevant information found. Try rephrasing your question."
-                        
-                        st.session_state.agent_complete = True
-                        st.session_state.agent_result = final_answer
-                        st.session_state.kb_query_processed = True
-                        return True
-                        
-                except Exception as e:
-                    error_msg = str(e)
-                    if "404" in error_msg or "DeploymentNotFound" in error_msg:
-                        fallback_answer = "Unable to search due to AI service configuration issue."
-                    elif "401" in error_msg:
-                        fallback_answer = "Unable to search due to authentication issues."
-                    else:
-                        fallback_answer = f"Search error: {error_msg}"
-                    
-                    st.session_state.agent_complete = True
-                    st.session_state.agent_result = fallback_answer
-                    st.session_state.kb_query_processed = True
-                    return True
+            # Process the original query
+            result = handle_modern_knowledge_base(original_query, manager)
+            
+            st.session_state.agent_complete = True
+            st.session_state.agent_result = result
+            st.session_state.kb_query_processed = True
+            return True
         
         else:
             # Show form for additional queries
-            with st.form("true_multimodal_query_form"):
+            with st.form("modern_rag_query_form"):
                 st.markdown("**Enter your question:**")
-                query = st.text_area("Query:", placeholder="Ask about documents with visual content...")
+                query = st.text_area("Query:", placeholder="Ask about document content...")
                 
-                submitted = st.form_submit_button("🚀 True Multimodal Search", type="primary")
+                submitted = st.form_submit_button("🚀 Modern RAG Search", type="primary")
                 
                 if submitted and query.strip():
-                    with st.spinner("🔍 True multimodal searching..."):
-                        try:
-                            start_time = time.time()
-                            results = vector_manager.search_similar(query.strip(), k=8)
-                            search_time = time.time() - start_time
-                            
-                            if results:
-                                # Display results
-                                st.markdown("### 🚀 True Multimodal Search Results")
-                                st.write(f"*Found {len(results)} relevant sections with embedded images in {search_time:.2f}s*")
-                                
-                                vector_manager.display_multimodal_results_streamlit(results)
-                                
-                                # Generate summary
-                                compressed_context = vector_manager.context_compression_multimodal(results, query.strip(), 4000)
-                                
-                                try:
-                                    openai_client = st.session_state.get('openai_client')
-                                    model_name = os.getenv("DEPLOYMENT_NAME")
-                                    
-                                    if openai_client and model_name and compressed_context:
-                                        summary_prompt = f"""Based on multimodal content (text + image descriptions), answer the user's question.
-
-User Question: {query}
-
-Relevant Multimodal Content:
-{compressed_context}
-
-Provide a direct, accurate answer based on both text and visual information."""
-
-                                        response = openai_client.chat.completions.create(
-                                            model=model_name,
-                                            messages=[{"role": "user", "content": summary_prompt}],
-                                            temperature=0.05,
-                                            max_tokens=700
-                                        )
-                                        
-                                        ai_summary = response.choices[0].message.content.strip()
-                                        
-                                        st.markdown("### 🤖 AI Summary (True Multimodal)")
-                                        st.write(ai_summary)
-                                        
-                                        final_answer = f"{ai_summary}\n\n*🚀 True multimodal search with embedded images in {search_time:.2f}s*"
-                                        
-                                except:
-                                    final_answer = f"Based on multimodal documents:\n{compressed_context}\n\n*🚀 Search completed in {search_time:.2f}s*"
-                                
-                                st.session_state.agent_complete = True
-                                st.session_state.agent_result = final_answer
-                                return True
-                                
-                            else:
-                                st.session_state.agent_complete = True
-                                st.session_state.agent_result = "No relevant information found in your documents."
-                                return True
-                                
-                        except Exception as e:
-                            error_msg = str(e)
-                            if "404" in error_msg:
-                                fallback_answer = "Unable to search due to AI service configuration issue."
-                            elif "401" in error_msg:
-                                fallback_answer = "Unable to search due to authentication issues."
-                            else:
-                                fallback_answer = f"Search error: {error_msg}"
-                            
-                            st.session_state.agent_complete = True
-                            st.session_state.agent_result = fallback_answer
-                            return True
+                    result = handle_modern_knowledge_base(query.strip(), manager)
+                    
+                    st.session_state.agent_complete = True
+                    st.session_state.agent_result = result
+                    return True
         
         # Option to ask another question
         if st.button("🔄 Ask Another Question"):
@@ -1738,15 +1860,16 @@ Provide a direct, accurate answer based on both text and visual information."""
     
     return False
 
+
 def main():
     st.set_page_config(
-        page_title="True Multimodal Multi-Agent Assistant",
+        page_title="Modern RAG Multi-Agent Assistant",
         page_icon="🚀",
         layout="wide"
     )
 
-    st.title("🚀 Multi-Agent Assistant with True Multimodal RAG")
-    st.markdown("Featuring **TRUE MULTIMODAL** text + image storage in embeddings, **embedded base64 images**, **inline image display**, **multimodal vector search**, **ultra-fast hybrid RAG**, **intelligent preprocessing**, and optimized processing for all your requests.")
+    st.title("🚀 Modern RAG Multi-Agent Assistant")
+    st.markdown("Featuring **latest RAG techniques**: **Token-based chunking**, **HyDE**, **Query expansion**, **MMR**, **Sentence windows**, **Parent-child chunks**, **Hybrid search**, and **Advanced retrieval** for superior document understanding.")
 
     # Initialize chatbot
     kernel, chat_service, openai_client = initialize_chatbot()
@@ -1767,11 +1890,12 @@ def main():
     
     show_debug_panel(openai_client, model_name, base_endpoint, api_version, api_key)
 
-    # Add true multimodal RAG UI to sidebar
-    vector_manager = create_true_multimodal_vector_store_ui(openai_client, model_name)
+    # Add modern RAG UI to sidebar
+    modern_manager = create_modern_rag_ui(openai_client, model_name)
     
-    # Store openai_client in session state
+    # Store managers in session state
     st.session_state.openai_client = openai_client
+    st.session_state.modern_rag_manager = modern_manager
 
     # Initialize session state
     if "messages" not in st.session_state:
@@ -1864,7 +1988,7 @@ def main():
                 "Report Fatigue": ("report_fatigue", "report fatigue or tiredness"), 
                 "Book Hotel": ("book_hotel", "book a hotel"),
                 "Book Limo": ("book_limo", "book a limo/transportation"),
-                "Search Knowledge Base": ("search_knowledge_base", "search documents and knowledge base")
+                "Search Knowledge Base": ("search_knowledge_base", "search documents with modern RAG techniques")
             }
             
             if category in valid_categories:
@@ -1886,14 +2010,14 @@ def main():
                 
             else:
                 # Unable to categorize
-                error_message = "🤔 I'm sorry, I couldn't categorize your request. I can help you with reporting sickness, reporting fatigue, booking hotels, booking transportation, or searching your documents. Could you please clarify what you need help with?"
+                error_message = "🤔 I'm sorry, I couldn't categorize your request. I can help you with reporting sickness, reporting fatigue, booking hotels, booking transportation, or searching your documents with modern RAG techniques. Could you please clarify what you need help with?"
                 st.session_state.messages.append({"role": "assistant", "content": error_message})
             
             st.rerun()
 
-    # Enhanced sidebar with true multimodal info
+    # Enhanced sidebar with modern RAG info
     with st.sidebar:
-        st.header("🚀 True Multimodal Multi-Agent Services")
+        st.header("🚀 Modern RAG Multi-Agent Services")
         st.markdown("""
         **I can help you with:**
         
@@ -1913,20 +2037,17 @@ def main():
         - Transportation, rides, car services
         - *No additional info required*
         
-        🚀 **True Multimodal RAG Search**
-        - **Images stored in embeddings** (not as files)
-        - **True multimodal vector search** with embedded images
-        - **Inline image display** with search results
-        - **Base64 image encoding** for vector storage
-        - **Vision model analysis** of image content
-        - **Hybrid retrieval** (Vector + BM25)
-        - **Context-aware follow-up** questions
-        - **Intelligent preprocessing** and chunking
-        - **Smart context compression** with image awareness
-        - Ask questions about PDFs with visual content
-        - Get AI summaries with multimodal context
-        - View images inline with relevant text
-        - *Requires: True Multimodal RAG system with PDFs*
+        🚀 **Modern RAG Search**
+        - **Token-based chunking** with tiktoken
+        - **HyDE** (Hypothetical Document Embeddings)
+        - **Query expansion** with LLM
+        - **MMR** (Maximal Marginal Relevance) for diversity
+        - **Sentence window** retrieval for context
+        - **Parent-child chunks** for better understanding
+        - **Hybrid search** (Vector + BM25)
+        - **Perfect for complex document queries**
+        - Ask questions about PDFs and get comprehensive answers
+        - *Requires: Modern RAG system with PDFs*
         """)
         
         st.header("💡 Example Requests")
@@ -1937,141 +2058,138 @@ def main():
         - "Feeling really drained"
         - "Can you get me a ride?"
         
-        **True Multimodal RAG Queries:**
-        - "How many years of experience does [person] have?"
-        - "What skills are mentioned in the resume?"
-        - "Find information about XYZ"
-        - "Show me any charts or diagrams"
-        - "What do the images show?"
-        - "Describe the visual content"
-        - "Are there any photos of horses?"
-        - "What technical diagrams are included?"
+        **Modern RAG Queries:**
+        - "What qualifications does [person] have?"
+        - "Summarize the main points of the document"
+        - "Find information about [specific topic]"
+        - "What experience does the candidate have?"
+        - "Tell me about the company's background"
+        - "What are the key findings in the report?"
         
         **📋 Context-Aware Follow-ups:**
-        - After asking about someone: "Which company does he work for?"
+        - After asking about someone: "What company does he work for?"
         - "What about his education?"
-        - "Show me related images"
-        - "What visual elements support this?"
+        - "What other skills does she have?"
+        - "Tell me more about their experience"
         """)
         
         # Show context status
         if st.session_state.get('last_successful_category') == "Search Knowledge Base":
-            st.info("🔗 **Context Active**: Follow-up questions will use Knowledge Base")
+            st.info("🔗 **Context Active**: Follow-up questions will search documents")
         
-        st.header("🚀 True Multimodal RAG Features")
-        multimodal_features = """
-        **🎯 TRUE MULTIMODAL SYSTEM:**
-        - **Images stored IN embeddings** (not as separate files)
-        - **Base64 encoded images** in vector store data
-        - **Inline image display** with search results
-        - **Multimodal embeddings** with image content analysis
-        - **Vision model integration** for image understanding
-        - **Smart image size optimization** and compression
-        - **Enhanced image extraction** with detailed logging
-        - **Better error handling** for image processing
-        - **Embedded image metadata** with descriptions
+        st.header("🚀 Modern RAG Techniques")
+        modern_features = """
+        **🎯 LATEST RAG TECHNIQUES:**
+        - **Token-based chunking** with tiktoken for proper token counting
+        - **Recursive text splitting** (LangChain-style) with multiple separators
+        - **Parent-child chunks** for hierarchical context
+        - **Sentence window retrieval** for better context boundaries
+        - **HyDE** (Hypothetical Document Embeddings) for query enhancement
+        - **Query expansion** with LLM for better matching
+        - **MMR** (Maximal Marginal Relevance) for diverse results
+        - **Normalized embeddings** with cosine similarity
         
-        **🔍 ENHANCED SEARCH:**
-        - **Hybrid retrieval**: Vector + BM25 sparse search
-        - **Intelligent preprocessing**: Structure-aware text processing
-        - **Context compression**: Optimal multimodal context for LLM
-        - **Reciprocal rank fusion**: Combines search strategies
-        - **Context-aware conversations**: Auto Knowledge Base routing
-        - **Query expansion**: Related terms and synonyms
-        
-        **⚡ PERFORMANCE:**
-        - **Ultra-fast system creation** with batch processing
+        **🔍 ADVANCED SEARCH:**
+        - **Hybrid retrieval**: Optimized Vector + BM25 search
+        - **Query enhancement** pipeline with multiple techniques
+        - **Context-aware results** with sentence windows
+        - **Parent context** retrieval for comprehensive answers
+        - **Quality-weighted scoring** and ranking
         - **GPU acceleration** when available
-        - **Smart memory management** for large files
-        - **Process up to 15 PDF files** simultaneously
-        - **Files up to 15MB** supported per file
-        - **Optimized embedding generation** in batches
+        
+        **📊 MODERN ARCHITECTURE:**
+        - **Optimized FAISS indices** with proper metrics
+        - **Batch embedding** creation for efficiency
+        - **Smart chunk validation** and filtering
+        - **Comprehensive metadata** extraction
+        - **Advanced tokenization** with tiktoken
         """
         
-        if MULTIMODAL_AVAILABLE:
-            multimodal_features += "\n- **✅ Full multimodal support** with PyMuPDF and Pillow"
-        else:
-            multimodal_features += "\n- **⚠️ Image support disabled**: Install PyMuPDF and Pillow"
+        st.markdown(modern_features)
         
-        st.markdown(multimodal_features)
-        
-        # Show knowledge base status
-        if VECTOR_STORE_AVAILABLE and "vector_manager" in st.session_state:
-            vector_manager = st.session_state.vector_manager
-            indices = vector_manager.load_search_indices()
-            if indices and indices.get("metadata"):
-                metadata = indices["metadata"]
-                sources = set(item.get("source", "") for item in metadata)
-                total_images = sum(len(item.get("embedded_images", [])) for item in metadata)
-                
-                search_types = ["True Multimodal Vector"]
-                if indices.get("bm25_index") and BM25_AVAILABLE:
-                    search_types.append("BM25")
+        # Show modern RAG status
+        if VECTOR_STORE_AVAILABLE and "modern_rag_manager" in st.session_state:
+            manager = st.session_state.modern_rag_manager
+            if manager:
+                indices = manager.load_indices()
+                if indices and indices.get("metadata"):
+                    metadata = indices["metadata"]
+                    parent_metadata = indices.get("parent_metadata", [])
+                    sources = set(item.get("source", "") for item in metadata)
+                    total_tokens = sum(item.get("tokens", 0) for item in metadata)
                     
-                # Check system type
-                system_info = indices.get("system_info", {})
-                system_type = "🚀 True Multimodal" if system_info.get("is_true_multimodal") else "⚠️ Legacy"
+                    # Check system features
+                    system_info = indices.get("system_info", {})
+                    techniques = []
+                    if system_info.get("use_hyde"):
+                        techniques.append("HyDE")
+                    if system_info.get("use_query_expansion"):
+                        techniques.append("Query Exp")
+                    if system_info.get("use_mmr"):
+                        techniques.append("MMR")
+                    if system_info.get("use_bm25"):
+                        techniques.append("BM25")
+                        
+                    st.success(f"🚀 Modern RAG Ready: {len(sources)} documents, {len(metadata)} chunks, {len(parent_metadata)} parents, {total_tokens:,} tokens ({'+'.join(techniques)})")
                     
-                st.success(f"📚🖼️ {system_type} RAG Ready: {len(sources)} documents, {len(metadata)} chunks, {total_images} embedded images ({'+'.join(search_types)})")
-                
-                if st.session_state.get('last_successful_category') == "Search Knowledge Base":
-                    st.info("🔗 Context Active: Next questions will use Knowledge Base")
-            else:
-                st.info("📚🖼️ True Multimodal RAG: Not created yet")
+                    if st.session_state.get('last_successful_category') == "Search Knowledge Base":
+                        st.info("🔗 Context Active: Next questions will search documents")
+                else:
+                    st.info("🚀 Modern RAG: Not created yet")
         
         st.markdown("---")
         st.header("🔧 Installation & Setup")
         st.markdown("""
-        **For True Multimodal RAG (Required):**
+        **For Modern RAG (Required):**
         ```bash
-        pip install faiss-cpu PyPDF2 rank-bm25 PyMuPDF Pillow
+        pip install faiss-cpu PyPDF2 rank-bm25 tiktoken
         ```
         
         **For GPU acceleration:**
         ```bash
-        pip install faiss-gpu PyPDF2 rank-bm25 PyMuPDF Pillow
+        pip install faiss-gpu PyPDF2 rank-bm25 tiktoken
         ```
         
         **Environment Variables:**
         ```bash
         ENDPOINT_URL=https://your-resource.openai.azure.com
         AZURE_OPENAI_API_KEY=your-api-key
-        DEPLOYMENT_NAME=your-model-deployment-name
+        DEPLOYMENT_NAME=your-deployment-name
         API_VERSION=2024-12-01-preview
         ```
         
-        **For Vision Model Support:**
-        - Use GPT-4 Vision model deployment
-        - Automatic image content analysis
-        - Enhanced multimodal understanding
-        
-        **🚀 TRUE MULTIMODAL ADVANTAGES:**
-        - ✅ **Images in embeddings** (not file storage)
-        - ✅ **Faster search** (no file I/O)
-        - ✅ **Better portability** (single vector store)
-        - ✅ **Inline display** (embedded base64)
-        - ✅ **Multimodal context** for AI responses
-        - ✅ **Optimized storage** with compression
-        - ✅ **Vision analysis** integrated in embeddings
-        - ✅ **No file management** overhead
+        **🚀 MODERN RAG ADVANTAGES:**
+        - ✅ **Token-based chunking** with proper token counting
+        - ✅ **HyDE** for enhanced query understanding
+        - ✅ **Query expansion** with LLM assistance
+        - ✅ **MMR** for diverse, non-redundant results
+        - ✅ **Sentence windows** for better context boundaries
+        - ✅ **Parent-child chunks** for comprehensive answers
+        - ✅ **Hybrid search** combining vector and keyword search
+        - ✅ **Normalized embeddings** with cosine similarity
+        - ✅ **Perfect for complex document analysis**
         """)
         
         # Show current status
         if VECTOR_STORE_AVAILABLE:
             gpu_status = "🚀 GPU" if GPU_AVAILABLE else "💻 CPU"
             bm25_status = "🔍 BM25" if BM25_AVAILABLE else "❌ BM25"
-            multimodal_status = "🖼️ True Multimodal" if MULTIMODAL_AVAILABLE else "❌ Images"
-            st.markdown(f"**Status:** {gpu_status} | {bm25_status} | {multimodal_status}")
+            try:
+                import tiktoken
+                tiktoken_status = "🔢 tiktoken"
+            except:
+                tiktoken_status = "❌ tiktoken"
+            st.markdown(f"**Status:** {gpu_status} | {bm25_status} | {tiktoken_status}")
             
-        if "openai_client" in st.session_state:
-            st.markdown("**🚀 True Multimodal RAG:** Full system ready")
+        if "openai_client" in st.session_state and "modern_rag_manager" in st.session_state:
+            st.markdown("**🚀 Modern RAG:** Full system ready")
         else:
             st.markdown("**❌ Configuration issue**")
         
         if st.button("🗑️ Clear Chat History"):
-            # Clear all session state
+            # Clear all session state except managers
             for key in list(st.session_state.keys()):
-                if key not in ['vector_manager', 'openai_client']:  # Keep these
+                if key not in ['modern_rag_manager', 'openai_client']:  # Keep these
                     del st.session_state[key]
             
             # Reinitialize required session state
@@ -2086,6 +2204,7 @@ def main():
             st.session_state.original_user_query = ""
             st.session_state.last_successful_category = None
             st.rerun()
+
 
 if __name__ == "__main__":
     main()
