@@ -538,7 +538,6 @@ Hypothetical answer:"""
             return expanded_query
             
         except Exception as e:
-            st.warning(f"HyDE generation failed: {e}")
             return query
     
     def expand_query(self, query: str) -> str:
@@ -571,7 +570,6 @@ Return only the additional terms, separated by spaces:"""
             return expanded_query
             
         except Exception as e:
-            st.warning(f"Query expansion failed: {e}")
             return query
     
     def maximal_marginal_relevance(self, query_embedding: np.ndarray, 
@@ -924,7 +922,7 @@ Return only the additional terms, separated by spaces:"""
                     if mmr_results:
                         return mmr_results
             except Exception as e:
-                st.warning(f"MMR failed, using standard ranking: {e}")
+                pass
         
         # Fallback: combine and rank results
         if all_results:
@@ -958,7 +956,7 @@ Return only the additional terms, separated by spaces:"""
             return results
             
         except Exception as e:
-            st.error(f"Vector search error: {str(e)}")
+            #st.error(f"Vector search error: {str(e)}")
             return []
     
     def _bm25_search(self, query: str, bm25_index, metadata: List[Dict], k: int) -> List[Dict]:
@@ -983,7 +981,6 @@ Return only the additional terms, separated by spaces:"""
             return results
             
         except Exception as e:
-            st.error(f"BM25 search error: {str(e)}")
             return []
     
     def _combine_results(self, results: List[Dict], k: int) -> List[Dict]:
@@ -1044,15 +1041,12 @@ Return only the additional terms, separated by spaces:"""
             with st.expander(title, expanded=(i <= 3)):
                 # Display main content
                 content = result.get("content", "")
-                st.write("**Chunk Content:**")
-                st.write(content)
+                #st.write("**Chunk Content:**")
+                #st.write(content)
                 
                 # Show window content if different
                 window_content = result.get("window_content", "")
-                if window_content and window_content != content:
-                    st.write("**Sentence Window Context:**")
-                    st.write(window_content)
-                
+
                 # Show parent context if available (without nested expander)
                 if parent_metadata:
                     parent_context = self.get_parent_context(result, parent_metadata)
@@ -1160,7 +1154,6 @@ Return only the additional terms, separated by spaces:"""
             }
             
         except Exception as e:
-            st.error(f"Error loading search indices: {str(e)}")
             return {}
     
     def extract_text_from_pdf(self, pdf_path: Path) -> str:
@@ -1466,12 +1459,10 @@ def create_modern_rag_ui(openai_client, model_name):
 
 def handle_modern_knowledge_base(query, manager):
     """Handle Knowledge Base queries with modern RAG techniques."""
-    st.markdown("🚀 **Modern RAG Knowledge Base Agent** is assisting you.")
     
     # Check if system exists
     indices = manager.load_indices()
     if not indices or not indices.get("metadata"):
-        st.error("❌ No modern RAG system found. Please create one first.")
         return "No system found."
     
     # Show system status
@@ -1490,10 +1481,8 @@ def handle_modern_knowledge_base(query, manager):
     if system_info.get("use_bm25"):
         techniques.append("BM25")
     
-    st.success(f"🚀 Using Modern RAG: {len(metadata)} chunks, {len(parent_metadata)} parents, {total_tokens:,} tokens ({', '.join(techniques)})")
-    
     # Process the query
-    with st.spinner("🔍 Searching with modern RAG techniques..."):
+    with st.spinner("🔍 Searching..."):
         try:
             start_time = time.time()
             
@@ -1512,21 +1501,6 @@ def handle_modern_knowledge_base(query, manager):
             
             if results:
                 # Display results
-                st.markdown(f"### 🚀 Modern RAG Search Results")
-                st.write(f"*Found {len(results)} relevant sections in {search_time:.2f}s*")
-                
-                # Show techniques used
-                techniques_used = set()
-                for result in results:
-                    if result.get("mmr_selected"):
-                        techniques_used.add("MMR")
-                    if result.get("search_type"):
-                        techniques_used.add(result["search_type"].upper())
-                
-                if techniques_used:
-                    st.info(f"🎯 Applied techniques: {', '.join(techniques_used)}")
-                
-                manager.display_modern_results(results)
                 
                 # Generate AI summary
                 try:
@@ -1572,41 +1546,17 @@ Provide a clear, detailed answer based on the content above."""
                             
                             ai_summary = response.choices[0].message.content.strip()
                             
-                            # Display AI summary
-                            st.markdown("### 🤖 AI Summary")
-                            st.write(ai_summary)
-                            
-                            final_result = f"{ai_summary}\n\n*🚀 Modern RAG search completed in {search_time:.2f}s*"
+                            #final_result = f"{ai_summary}\n\n*🚀 Modern RAG search completed in {search_time:.2f}s*"
+                            final_result = f"{ai_summary}"
                             return final_result
                             
                 except Exception as e:
-                    st.warning(f"AI summary generation failed: {str(e)}")
+                    pass
                 
                 return f"Found {len(results)} relevant sections with modern RAG techniques in {search_time:.2f}s"
                 
             else:
-                # Show sample content if no results
-                try:
-                    if metadata:
-                        st.markdown("No specific matches found, but here's sample content from your modern RAG system:")
-                        
-                        sample_items = metadata[:4]
-                        for i, item in enumerate(sample_items, 1):
-                            with st.expander(f"Sample {i} (from {item.get('source', 'Unknown')})", expanded=(i==1)):
-                                content = item.get('content', '')[:400]
-                                if len(item.get('content', '')) > 400:
-                                    content += "..."
-                                st.write(content)
-                                
-                                # Show metadata
-                                if item.get('tokens'):
-                                    st.caption(f"Tokens: {item['tokens']}, Type: {item.get('chunk_type', 'child')}")
-                        
-                        return f"Sample content shown. Total: {len(metadata)} chunks with {total_tokens:,} tokens."
-                    else:
-                        return "No relevant information found. Try rephrasing your question."
-                except:
-                    return "No relevant information found. Try rephrasing your question."
+                return "No relevant information found. Try rephrasing your question."
                 
         except Exception as e:
             error_msg = str(e)
@@ -1678,7 +1628,7 @@ def handle_agent_conversation(category):
             return True
             
     elif category == "Search Knowledge Base":
-        st.markdown("🚀 **Modern RAG Knowledge Base Agent** is now assisting you.")
+        #st.markdown("🚀 **Modern RAG Knowledge Base Agent** is now assisting you.")
         
         # Check if modern manager exists
         if "modern_rag_manager" not in st.session_state or st.session_state.modern_rag_manager is None:
@@ -1707,8 +1657,6 @@ def handle_agent_conversation(category):
             techniques.append("MMR")
         if system_info.get("use_bm25"):
             techniques.append("BM25")
-        
-        st.success(f"🚀 Using Modern RAG ({', '.join(techniques)})")
         
         # Check for original query from routing
         original_query = st.session_state.get('original_user_query', '')
